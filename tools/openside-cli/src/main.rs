@@ -739,45 +739,51 @@ fn installs_view(data: &Value) -> Vec<Line<'static>> {
 const BOT_MAP: [&str; 24] = [
         "kkkkkkkkkkBkkkkkkkkkkk",
         "kkkkkkkkDBBBBkkkkkkkkk",
-        "kkkkkkkkBDBFBBkkkkkkkk",
-        "kkkkkkkkkBFBBkkkkkkkkk",
-        "kkkkkkDBBBBBAFkkkkkkkk",
-        "kkkkkBDBABBBFFDkkkkkkk",
-        "kkkkDDBBBBBBBFBFFkkkkk",
-        "kkkBDBABBBBBBDBABkkkkk",
-        "kkCkBDBFDBFBAEkAFkkkkk",
-        "kkBAABDFBBAAFBBBFFkkkk",
-        "kkkFBFBFBAAFABkBFFkkkk",
-        "kDDFBFFFABFFSSSAFFBFDk",
-        "kCBFXFBFFBSSSMMVvkkkkk",
-        "kkFAFFSFSkSSSVVMMVvkkk",
-        "kFSwIVwSSSSVwIVSkVvkkk",
-        "kkFSVIwSSVVIVIVSWkFkkk",
-        "kkFSwSSVVWIVSIVVSkkkkk",
-        "kkkSMwSSSVVWVVwSVkkkkk",
-        "kkkkSSwXwWMKwwSVkkkkkk",
-        "kkkkkSwWWXwWwWSFkkkkkk",
-        "kkkkkkWSSWWVWSFFkkkkkk",
-        "kkkkkkkWSVWVSkkkkkkkkk",
-        "kkkkkkkkXRkWWkkkkkkkkk",
+        "kkkkkkkkFBFFBBkkkkkkkk",
+        "kkkkkkkkkBFFFBkkkkkkkk",
+        "kkkkkkkBBBBBkFFkkkkkkk",
+        "kkkkkBBBBBBBBBBkkkkkkk",
+        "kkkkEBBBBBBBBFBBkkkkkk",
+        "kkkBDBBBBBBBBDBFFkkkkk",
+        "kkkFBBBBBBBBFBBFFFkkkk",
+        "kkkBBBBFBBBBBBBFFFkkkk",
+        "kkkBBBBFBBBFFBBBFFFkkk",
+        "kkBBBFBFFBBFkkBBFFkFkk",
+        "kkBBBFkFFBFFkSkBFFBkBk",
+        "kkFFkFSFSFMSSSBBSkFDkk",
+        "kkFFWSSSSSWkkMUBWkBBkk",
+        "kkFFkkkMSUSSSSBBWFFBkk",
+        "kkkFUSSSMSSSSvFBkFFFBk",
+        "kkkFkkvSSSSISSBkFFFkBk",
+        "kkkkkkSSSSSSSSkkFFBkFk",
+        "kkkkFkkSSSwwISkkFFBkkk",
+        "kkkkkkkkSSSSSXkkkFFkkk",
+        "kkkkkkkkkSSSRkkkkkFBkk",
+        "kkkkkkkkkkkRkkkkkkkFFk",
         "kkkkkkkkkkkkkkkkkkkkkk",
 ];
 
-const BOT_PAL: [(char, Color); 14] = [
+// paleta completa da personagem, um char por hex
+const BOT_PAL: [(char, Color); 19] = [
     ('A', Color::Rgb(0x02, 0x6D, 0x4F)), // verde principal
     ('B', Color::Rgb(0x02, 0x61, 0x48)), // verde escuro
     ('C', Color::Rgb(0x04, 0x47, 0x38)), // sombras
-    ('D', Color::Rgb(0x64, 0xE0, 0xA4)), // reflexo claro
-    ('E', Color::Rgb(0x24, 0xA0, 0x67)), // reflexo medio
-    ('F', Color::Rgb(0x01, 0x2D, 0x2D)), // contorno verde
+    ('D', Color::Rgb(0x64, 0xE0, 0xA4)), // reflexos claros
+    ('E', Color::Rgb(0x24, 0xA0, 0x67)), // reflexos medios
+    ('F', Color::Rgb(0x01, 0x2D, 0x2D)), // contorno
     ('S', Color::Rgb(0xFD, 0xD8, 0xBC)), // pele base
-    ('X', Color::Rgb(0xAE, 0x55, 0x44)), // pele sombra profunda
-    ('V', Color::Rgb(0x84, 0x2A, 0xA9)), // rocco oculos
-    ('v', Color::Rgb(0xAA, 0x4E, 0xCB)), // oculos reflexo
-    ('I', Color::Rgb(0xBE, 0x9D, 0x7A)), // ouro da ris
+    ('L', Color::Rgb(0xED, 0xB8, 0x9C)), // pele luz
+    ('W', Color::Rgb(0xED, 0x87, 0x68)), // pele sombra quente
+    ('X', Color::Rgb(0xDF, 0x73, 0x59)), // pele sombra profunda
+    ('R', Color::Rgb(0xAE, 0x55, 0x44)), // contorno quente
+    ('V', Color::Rgb(0x84, 0x2A, 0xA9)), // roxo principal
+    ('v', Color::Rgb(0xAA, 0x4E, 0xCB)), // roxo reflexo
+    ('U', Color::Rgb(0x62, 0x17, 0x81)), // roxo sombra
+    ('h', Color::Rgb(0xBD, 0xB4, 0xDA)), // roxo brilho claro
+    ('I', Color::Rgb(0xBE, 0x9D, 0x7A)), // uris dourada
     ('M', Color::Rgb(0x34, 0x22, 0x21)), // marrom escuro
     ('w', Color::Rgb(0xFF, 0xFF, 0xFF)), // branco
-    ('k', Color::Rgb(0x00, 0x00, 0x00)), // contorno preto
+    ('k', Color::Rgb(0x00, 0x00, 0x00)), // preto
 ];
 
 fn bot_tint(c: char) -> Color {
