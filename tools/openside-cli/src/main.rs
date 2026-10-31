@@ -961,7 +961,7 @@ mod tests {
         assert!(empty[0].spans[0].content.contains("no iPhone"));
         let d = serde_json::json!([{"serial":"00008030-0009454E0C84802E","connection_type":"USB","device_id":1}]);
         let rows = devices_view(&d);
-        assert!(rows[0].spans[2].content.contains("402E"));
+        assert!(rows[0].spans[2].content.contains("802E"));
         assert!(rows[0].spans[0].content.contains("●"));
     }
 
