@@ -527,16 +527,22 @@ fn command_view(cmd: &str, data: &Value) -> Vec<Line<'static>> {
         "devices" => devices_view(data),
         "installs" => installs_view(data),
         "device-info" => kv_view(data),
-        "version" => vec![Line::from(Span::styled(
-            format!(
-                "engine {}",
-                match data.get("version").and_then(Value::as_str) {
-                    Some(v) => v.to_string(),
-                    None => data.to_string(),
-                }
-            ),
-            st(CY).add_modifier(Modifier::BOLD),
-        ))],
+        "version" => vec![
+            Line::from(Span::styled(
+                format!("tui {}", env!("CARGO_PKG_VERSION")),
+                st(MAG).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "engine {}",
+                    match data.get("version").and_then(Value::as_str) {
+                        Some(v) => v.to_string(),
+                        None => data.to_string(),
+                    }
+                ),
+                st(CY).add_modifier(Modifier::BOLD),
+            )),
+        ],
         // accounts/slots output is a dict of account/device summaries
         "login" if data.get("accounts").is_some() || data.get("authenticated").is_some() => {
             login_status_view(data)
@@ -816,20 +822,20 @@ fn open_ipa_picker(app: &mut App, cmd: &'static str) {
     }
 }
 
-/// home-screen tiles: (label, action, icon, accent, one-liner)
+/// home-screen tiles: (label, action, icon, accent)
 const TILES: &[Entry] = &[
-    Entry("sideload", Item::PickIpa("sideload"), "⇩", CY, "sign + install an .ipa"),
-    Entry("installs", Item::Run("installs"), "▤", GRN, "apps + days until expiry"),
-    Entry("devices", Item::Run("devices"), "▟▛", MAG, "connected iPhones"),
-    Entry("doctor", Item::Run("doctor"), "✚", YEL, "engine self-check"),
-    Entry("refresh", Item::Run("refresh"), "↻", GRN, "re-sign apps expiring"),
-    Entry("uninstall", Item::PickApp(AppAction::Uninstall), "✕", RED, "remove a sideloaded app"),
-    Entry("apple id", Item::Login, "☁", CY, "sign in · teams · slots"),
-    Entry("more…", Item::Palette, "▪", GRAY, "all 28 commands"),
+    Entry("sideload", Item::PickIpa("sideload"), "⇩", CY),
+    Entry("installs", Item::Run("installs"), "▤", GRN),
+    Entry("devices", Item::Run("devices"), "▟▛", MAG),
+    Entry("doctor", Item::Run("doctor"), "✚", YEL),
+    Entry("refresh", Item::Run("refresh"), "↻", GRN),
+    Entry("uninstall", Item::PickApp(AppAction::Uninstall), "✕", RED),
+    Entry("apple id", Item::Login, "☁", CY),
+    Entry("more…", Item::Palette, "▪", GRAY),
 ];
 
 #[derive(Clone, Copy)]
-struct Entry(&'static str, Item, &'static str, Color, &'static str);
+struct Entry(&'static str, Item, &'static str, Color);
 
 /// grid nav in a 2-column launcher
 fn tile_move(i: usize, key: char) -> usize {
@@ -1060,19 +1066,20 @@ fn main() -> io::Result<()> {
                 header[1],
             );
 
-            let body = Layout::horizontal([Constraint::Percentage(46), Constraint::Min(0)])
+            let body = Layout::horizontal([Constraint::Length(24), Constraint::Min(0)])
                 .split(rows[1]);
 
             // ---- launcher grid (2 columns of big buttons) ----
             hit_tiles.clear();
             let tile_rows_n = (TILES.len() + 1) / 2;
-            let tile_rows: Vec<Constraint> = (0..tile_rows_n).map(|_| Constraint::Min(1)).collect();
+            let tile_rows: Vec<Constraint> =
+                (0..tile_rows_n).map(|_| Constraint::Length(3)).collect();
             let tile_splits: Vec<Rect> =
                 Layout::vertical(tile_rows).split(body[0]).to_vec();
             for t in 0..TILES.len() {
                 let row = t / 2;
                 let col = t % 2;
-                let Entry(label, _item, icon, accent, desc) = TILES[t];
+                let Entry(label, _item, icon, accent) = TILES[t];
 
                 let picked = app.selection == t;
                 let spot = tile_splits[row];
@@ -1080,9 +1087,6 @@ fn main() -> io::Result<()> {
                     Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                         .areas(spot);
                 let cell = halves[col];
-                let inner_rect: [Rect; 2] =
-                    Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
-                        .areas(cell);
                 let block = Block::bordered()
                     .border_set(border::QUADRANT_OUTSIDE)
                     .border_style(Style::new().fg(if picked { accent } else { GRAY }))
@@ -1091,19 +1095,17 @@ fn main() -> io::Result<()> {
                 let pad: Rect = block.inner(cell);
                 f.render_widget(
                     Paragraph::new(Line::from(vec![
-                        Span::styled(icon, Style::new().fg(if picked { accent } else { CY }).add_modifier(Modifier::BOLD)),
-                        Span::styled(format!(" {label}"), st(Color::White).add_modifier(if picked { Modifier::BOLD } else { Modifier::empty() })),
+                        Span::styled(
+                            icon,
+                            Style::new().fg(if picked { accent } else { CY }).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!(" {label}"),
+                            st(Color::White).add_modifier(if picked { Modifier::BOLD } else { Modifier::empty() }),
+                        ),
                     ]))
                     .style(Style::new().bg(if picked { DARK } else { BG })),
                     pad,
-                );
-                f.render_widget(
-                    Paragraph::new(Line::from(Span::styled(
-                        desc,
-                        st(if picked { accent } else { GRAY }).add_modifier(Modifier::DIM),
-                    )))
-                    .style(Style::new().bg(if picked { DARK } else { BG })),
-                    inner_rect[1],
                 );
                 hit_tiles.push((block.inner(cell), t));
             }
@@ -1435,7 +1437,8 @@ mod tests {
     #[test]
     fn version_panel_and_login_accounts() {
         let v = command_view("version", &serde_json::json!({"version":"1.2.10"}));
-        assert!(v[0].spans[0].content.contains("engine 1.2.10"));
+        assert!(v[0].spans[0].content.contains("tui 0.1.0"));
+        assert!(v[1].spans[0].content.contains("engine 1.2.10"));
         let acc = command_view("login", &serde_json::json!({"accounts":[{"email":"a@b","team_id":"T1","active":true}]}));
         assert!(acc[0].spans[0].content.contains("●"));
         let auth = command_view("login", &serde_json::json!({"authenticated":true,"email":"a@b"}));
