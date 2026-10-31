@@ -140,6 +140,8 @@ enum Choice {
     Forget(String),    // bundle id
     /// arbitrary `<cmd> <one-arg>` (inspect/sign .ipa)
     RunWith(String, String),
+    /// activate a menu entry by index (command palette)
+    MenuRun(usize),
 }
 
 enum DialogKind {
@@ -147,6 +149,7 @@ enum DialogKind {
     Input { prompt: String, masked: bool, buffer: String },
 }
 
+#[derive(Clone, Copy)]
 enum Item {
     /// non-selectable group title
     Header,
@@ -158,6 +161,8 @@ enum Item {
     PickApp(AppAction),
     /// sign in to an Apple ID (email → password → 2FA wizard)
     Login,
+    /// command palette with the full catalog
+    Palette,
 }
 
 #[derive(Clone, Copy)]
@@ -788,25 +793,6 @@ fn real_scroll(len: usize, height: u16, stored: u16, bottom: bool) -> u16 {
     }
 }
 
-fn relative_selection(from: usize, dir: i32, count: usize) -> usize {
-    let mut i = from;
-    loop {
-        if dir < 0 {
-            i = i.saturating_sub(1);
-        } else {
-            i = (i + 1).min(count - 1);
-        }
-        if dir < 0 && i == 0 && !MENU[0].1.selectable() {
-            return i;
-        }
-        if MENU[i].1.selectable() {
-            return i;
-        }
-        if i == 0 || (dir > 0 && i == count - 1 && !MENU[i].1.selectable()) {
-            return from;
-        }
-    }
-}
 
 /// open the .ipa picker for a command that takes a path
 fn open_ipa_picker(app: &mut App, cmd: &'static str) {
@@ -830,6 +816,33 @@ fn open_ipa_picker(app: &mut App, cmd: &'static str) {
     }
 }
 
+/// home-screen tiles: (label, action, icon, accent, one-liner)
+const TILES: &[Entry] = &[
+    Entry("sideload", Item::PickIpa("sideload"), "⇩", CY, "sign + install an .ipa"),
+    Entry("installs", Item::Run("installs"), "▤", GRN, "apps + days until expiry"),
+    Entry("devices", Item::Run("devices"), "▟▛", MAG, "connected iPhones"),
+    Entry("doctor", Item::Run("doctor"), "✚", YEL, "engine self-check"),
+    Entry("refresh", Item::Run("refresh"), "↻", GRN, "re-sign apps expiring"),
+    Entry("uninstall", Item::PickApp(AppAction::Uninstall), "✕", RED, "remove a sideloaded app"),
+    Entry("apple id", Item::Login, "☁", CY, "sign in · teams · slots"),
+    Entry("more…", Item::Palette, "▪", GRAY, "all 28 commands"),
+];
+
+#[derive(Clone, Copy)]
+struct Entry(&'static str, Item, &'static str, Color, &'static str);
+
+/// grid nav in a 2-column launcher
+fn tile_move(i: usize, key: char) -> usize {
+    let last = TILES.len() - 1;
+    match key {
+        'l' => if i % 2 == 0 && i < last { i + 1 } else { i },
+        'h' => if i % 2 == 1 { i - 1 } else { i },
+        'j' => (i + 2).min(last),
+        'k' => i.saturating_sub(2),
+        _ => i,
+    }
+}
+
 fn connected(devices: &Option<Value>) -> usize {
     devices
         .as_ref()
@@ -838,7 +851,7 @@ fn connected(devices: &Option<Value>) -> usize {
         .unwrap_or(0)
 }
 
-const FOOT: &str = " ↑↓/click pick · click again or ⏎ run · esc quit ";
+const FOOT: &str = " ←↑↓→/click tile · ⏎ run · tab all commands · esc quit ";
 
 /// run the currently selected menu entry (key ⏎ or second click)
 fn activate_menu(app: &mut App) {
@@ -853,8 +866,27 @@ fn activate_menu(app: &mut App) {
             app.run(vec!["installs".into()]);
         }
         Item::Login => start_login(app),
+        Item::Palette => open_palette(app),
         Item::Header => {}
     }
+}
+
+fn open_palette(app: &mut App) {
+    let items = MENU
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, item))| item.selectable())
+        .map(|(index, (name, _))| {
+            (
+                format!("▪ {name}  —  {}", MENU_DESC[index]),
+                Choice::MenuRun(index),
+            )
+        })
+        .collect();
+    app.dialog = Some(Dialog {
+        title: "all commands".into(),
+        kind: DialogKind::Pick { items, sel: 0 },
+    });
 }
 
 fn start_login(app: &mut App) {
@@ -950,6 +982,10 @@ fn confirm_dialog(app: &mut App) {
                 Some((_, Choice::Uninstall(bundle))) => app.run(vec!["uninstall".into(), bundle]),
                 Some((_, Choice::Refresh(bundle))) => app.run(vec!["refresh".into(), bundle]),
                 Some((_, Choice::Forget(bundle))) => app.run(vec!["forget".into(), bundle]),
+                Some((_, Choice::MenuRun(index))) => {
+                    app.selection = index;
+                    activate_menu(app);
+                }
                 _ => {}
             },
             _ => {}
@@ -990,7 +1026,7 @@ fn main() -> io::Result<()> {
             engine.send(id, &args)?;
         }
 
-        let mut hit_menu_list = Rect::default();
+        let mut hit_tiles: Vec<(Rect, usize)> = Vec::new();
         let mut hit_dialog_list = Rect::default();
         terminal.draw(|f| {
             let area = f.area();
@@ -1024,40 +1060,55 @@ fn main() -> io::Result<()> {
                 header[1],
             );
 
-            let body = Layout::horizontal([Constraint::Length(32), Constraint::Min(0)])
+            let body = Layout::horizontal([Constraint::Percentage(46), Constraint::Min(0)])
                 .split(rows[1]);
-            let menu_cols: [Rect; 2] =
-                Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(
-                    box_title(f, body[0], "commands", CY),
-                );
-            hit_menu_list = menu_cols[0];
-            let mut list = ListState::default();
-            if MENU[app.selection].1.selectable() {
-                list.select(Some(app.selection));
-            }
-            let items = MENU
-                .iter()
-                .map(|(name, item)| match item {
-                    Item::Header => format!("  {name}"),
-                    _ => format!(" ▪ {name}"),
-                })
-                .collect::<Vec<String>>();
-            f.render_stateful_widget(
-                List::new(items)
-                    .highlight_symbol("» ")
-                    .highlight_style(st(Color::White).add_modifier(Modifier::BOLD)),
-                menu_cols[0],
-                &mut list,
-            );
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!(" {} ", MENU_DESC[app.selection]),
-                    st(GRAY).add_modifier(Modifier::DIM),
-                )))
-                .style(Style::new().bg(BG)),
-                menu_cols[1],
-            );
 
+            // ---- launcher grid (2 columns of big buttons) ----
+            hit_tiles.clear();
+            let tile_rows_n = (TILES.len() + 1) / 2;
+            let tile_rows: Vec<Constraint> = (0..tile_rows_n).map(|_| Constraint::Min(1)).collect();
+            let tile_splits: Vec<Rect> =
+                Layout::vertical(tile_rows).split(body[0]).to_vec();
+            for t in 0..TILES.len() {
+                let row = t / 2;
+                let col = t % 2;
+                let Entry(label, _item, icon, accent, desc) = TILES[t];
+
+                let picked = app.selection == t;
+                let spot = tile_splits[row];
+                let halves: [Rect; 2] =
+                    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .areas(spot);
+                let cell = halves[col];
+                let inner_rect: [Rect; 2] =
+                    Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
+                        .areas(cell);
+                let block = Block::bordered()
+                    .border_set(border::QUADRANT_OUTSIDE)
+                    .border_style(Style::new().fg(if picked { accent } else { GRAY }))
+                    .style(Style::new().bg(if picked { DARK } else { BG }));
+                f.render_widget(&block, cell);
+                let pad: Rect = block.inner(cell);
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(icon, Style::new().fg(if picked { accent } else { CY }).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!(" {label}"), st(Color::White).add_modifier(if picked { Modifier::BOLD } else { Modifier::empty() })),
+                    ]))
+                    .style(Style::new().bg(if picked { DARK } else { BG })),
+                    pad,
+                );
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        desc,
+                        st(if picked { accent } else { GRAY }).add_modifier(Modifier::DIM),
+                    )))
+                    .style(Style::new().bg(if picked { DARK } else { BG })),
+                    inner_rect[1],
+                );
+                hit_tiles.push((block.inner(cell), t));
+            }
+
+            // ---- module panel ----
             let panel_live = !app.panel.is_empty();
             let title = if panel_live {
                 format!("{} ", if app.last_cmd.is_empty() { "output" } else { &app.last_cmd })
@@ -1220,15 +1271,14 @@ fn main() -> io::Result<()> {
                 if key.kind == crossterm::event::KeyEventKind::Press =>
             {
                 match key.code {
-                    crossterm::event::KeyCode::Up => {
-                        app.selection = relative_selection(app.selection, -1, MENU.len())
-                    }
-                    crossterm::event::KeyCode::Down => {
-                        app.selection = relative_selection(app.selection, 1, MENU.len())
-                    }
+                    crossterm::event::KeyCode::Up => app.selection = tile_move(app.selection, 'k'),
+                    crossterm::event::KeyCode::Down => app.selection = tile_move(app.selection, 'j'),
+                    crossterm::event::KeyCode::Left => app.selection = tile_move(app.selection, 'h'),
+                    crossterm::event::KeyCode::Right => app.selection = tile_move(app.selection, 'l'),
                     crossterm::event::KeyCode::Home => app.selection = 0,
-                    crossterm::event::KeyCode::End => app.selection = MENU.len() - 1,
+                    crossterm::event::KeyCode::End => app.selection = TILES.len() - 1,
                     crossterm::event::KeyCode::Enter => activate_menu(&mut app),
+                    crossterm::event::KeyCode::Tab => open_palette(&mut app),
                     crossterm::event::KeyCode::PageUp => {
                         log_bottom = false;
                     }
@@ -1274,18 +1324,18 @@ fn main() -> io::Result<()> {
                             app.dialog = None;
                             last_click = None;
                         }
-                    } else if my >= hit_menu_list.y
-                        && my < hit_menu_list.y + hit_menu_list.height
-                        && mx >= hit_menu_list.x
+                    } else if let Some(&(rect, tile_index)) =
+                        hit_tiles.iter().find(|(r, _)| mx >= r.x && mx < r.x + r.width && my >= r.y && my < r.y + r.height)
                     {
-                        let idx = ((my - hit_menu_list.y) as usize).min(MENU.len() - 1);
-                        if idx == app.selection && last_click.is_some() {
+                        if tile_index == app.selection && last_click.is_some() {
+                            // second click on the same tile = run
                             activate_menu(&mut app);
                             last_click = None;
                         } else {
-                            app.selection = idx;
+                            app.selection = tile_index;
                             last_click = Some((mx, my));
                         }
+                        let _ = rect;
                     } else {
                         last_click = None;
                     }
