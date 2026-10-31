@@ -24,14 +24,14 @@ use serde_json::{json, Value};
 // ---- palette (ratscope pixel theme) ----
 // Maki palette — from the reference art: night-blue bg, dark green hair,
 // violet glasses, warm skin. Roles unchanged (info/success/warn/destroy).
-const CY: Color = Color::Rgb(107, 143, 212);
-const MAG: Color = Color::Rgb(163, 122, 204);
-const GRN: Color = Color::Rgb(99, 160, 101);
-const RED: Color = Color::Rgb(199, 106, 118);
-const YEL: Color = Color::Rgb(207, 178, 135);
-const GRAY: Color = Color::Rgb(117, 128, 154);
-const BG: Color = Color::Rgb(13, 16, 32);
-const DARK: Color = Color::Rgb(9, 12, 24);
+const CY: Color = Color::Rgb(86, 146, 240);
+const MAG: Color = Color::Rgb(196, 120, 255);
+const GRN: Color = Color::Rgb(80, 200, 110);
+const RED: Color = Color::Rgb(240, 84, 106);
+const YEL: Color = Color::Rgb(248, 200, 120);
+const GRAY: Color = Color::Rgb(122, 132, 160);
+const BG: Color = Color::Rgb(12, 15, 34);
+const DARK: Color = Color::Rgb(8, 10, 24);
 
 /// every painted cell carries the app bg so transparent terminals stay solid
 fn st(fg: Color) -> Style {
@@ -732,63 +732,6 @@ fn installs_view(data: &Value) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// portrait palette: hair dark green / lighter green / skin / glasses /
-/// eyes / teeth / uniform — '.' is transparent (renders as bg)
-const HAIR: Color = Color::Rgb(56, 112, 66);
-const HAIR_HI: Color = Color::Rgb(88, 156, 92);
-const SKIN: Color = Color::Rgb(240, 196, 140);
-const VIOLET: Color = Color::Rgb(178, 118, 240);
-const INK: Color = Color::Rgb(24, 26, 34);
-const TEETH: Color = Color::Rgb(238, 238, 240);
-const UNIFORM: Color = Color::Rgb(72, 64, 104);
-
-/// maki head bot, hand-drawn 12 rows x 9 cols, rendered as half-blocks
-fn maki_lines() -> Vec<Line<'static>> {
-    let map: [&str; 12] = [
-        "...hhhh..",
-        "..hhhhhh.",
-        ".hHhhhhHH",
-        ".hhhhhhhh",
-        ".hhhhhhhh",
-        "hgssgssgh",
-        "hgesgesgh",
-        "hssswwssh",
-        ".hsssssh.",
-        "..usssu..",
-        ".uuuuuuu.",
-        "uuuuuuuuu",
-    ];
-    let tint = |c: char| match c {
-        'h' => HAIR,
-        'H' => HAIR_HI,
-        's' => SKIN,
-        'g' => VIOLET,
-        'e' => INK,
-        'w' => TEETH,
-        'u' => UNIFORM,
-        _ => BG,
-    };
-    (0..map.len().div_ceil(2))
-        .map(|pair| {
-            let top = map[pair * 2];
-            let empty = ".".repeat(map[0].len());
-            let bot = map.get(pair * 2 + 1).copied().unwrap_or(empty.as_str());
-            let mut spans = Vec::with_capacity(top.len());
-            for (t, b) in top.chars().zip(bot.chars()) {
-                if t == '.' && b == '.' {
-                    spans.push(Span::styled(" ", st(BG)));
-                } else {
-                    spans.push(Span::styled(
-                        "▀",
-                        Style::new().fg(tint(t)).bg(if b == '.' { BG } else { tint(b) }),
-                    ));
-                }
-            }
-            Line::from(spans)
-        })
-        .collect()
-}
-
 // ---- header logo, half-block rendering ----
 /// line-by-line gradient: rgb lerp between stops over the 12 pixel rows
 fn mix(a: Color, b: Color, t: f32) -> Color {
@@ -1100,14 +1043,26 @@ fn main() -> io::Result<()> {
             ])
             .split(area);
             let header = Layout::horizontal([
-                Constraint::Length(9),
-                Constraint::Length(2),
+                Constraint::Length(1),
                 Constraint::Length(57),
                 Constraint::Min(0),
             ])
             .split(rows[0]);
-            f.render_widget(Paragraph::new(maki_lines()), header[1]);
-            f.render_widget(Paragraph::new(logo_lines("openside")), header[2]);
+            f.render_widget(Paragraph::new(logo_lines("openside")), header[1]);
+            let tagrow = Layout::horizontal([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(2),
+            ])
+            .split(rows[0]);
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "  fix-it style sideloader · v0.1.0",
+                    st(GRAY),
+                )))
+                .style(Style::new().bg(BG)),
+                tagrow[1],
+            );
             let n_devices = connected(&app.devices);
             let busy = app.spinner.is_some() || app.app_action.is_some();
             f.render_widget(
@@ -1424,16 +1379,7 @@ mod tests {
             Color::Rgb(r, g, b) => (r, g, b),
             _ => (0, 0, 0),
         };
-        assert!(r > 90 && r < 180 && b > 180, "meio tende ao violeta: {mid:?}");
-    }
-
-    #[test]
-    fn maki_grid_dims_and_halfblock_rows() {
-        let lines = maki_lines();
-        assert_eq!(lines.len(), 6); // 12 pixel rows → 6 terminal rows
-        for line in &lines {
-            assert_eq!(line.spans.len(), 9);
-        }
+        assert!(r > 150 && r < 210 && b > 200, "meio tende ao violeta: {mid:?}");
     }
 
     #[test]
