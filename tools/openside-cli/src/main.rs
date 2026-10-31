@@ -24,13 +24,13 @@ use serde_json::{json, Value};
 // ---- palette (ratscope pixel theme) ----
 // Maki palette — from the reference art: night-blue bg, dark green hair,
 // violet glasses, warm skin. Roles unchanged (info/success/warn/destroy).
-const CY: Color = Color::Rgb(96, 148, 224);
-const MAG: Color = Color::Rgb(178, 118, 240);
-const GRN: Color = Color::Rgb(94, 158, 96);
-const RED: Color = Color::Rgb(214, 74, 92);
-const YEL: Color = Color::Rgb(242, 198, 138);
-const GRAY: Color = Color::Rgb(112, 118, 142);
-const BG: Color = Color::Rgb(14, 17, 32);
+const CY: Color = Color::Rgb(107, 143, 212);
+const MAG: Color = Color::Rgb(163, 122, 204);
+const GRN: Color = Color::Rgb(99, 160, 101);
+const RED: Color = Color::Rgb(199, 106, 118);
+const YEL: Color = Color::Rgb(207, 178, 135);
+const GRAY: Color = Color::Rgb(117, 128, 154);
+const BG: Color = Color::Rgb(13, 16, 32);
 const DARK: Color = Color::Rgb(9, 12, 24);
 
 /// every painted cell carries the app bg so transparent terminals stay solid
@@ -747,12 +747,12 @@ fn maki_lines() -> Vec<Line<'static>> {
     let map: [&str; 12] = [
         "...hhhh..",
         "..hhhhhh.",
-        ".hhhhhhhh",
+        ".hHhhhhHH",
         ".hhhhhhhh",
         ".hhhhhhhh",
         "hgssgssgh",
         "hgesgesgh",
-        "hssswsssh",
+        "hssswwssh",
         ".hsssssh.",
         "..usssu..",
         ".uuuuuuu.",
@@ -855,6 +855,7 @@ fn pblock(col: Color) -> Block<'static> {
         .border_set(border::QUADRANT_OUTSIDE)
         .border_style(st(col))
         .style(Style::new().bg(BG))
+        .padding(ratatui::widgets::Padding::horizontal(1))
 }
 
 fn box_title(f: &mut ratatui::Frame, area: Rect, title: &str, col: Color) -> Rect {
@@ -1093,13 +1094,14 @@ fn main() -> io::Result<()> {
 
             let rows = Layout::vertical([
                 Constraint::Length(logo::SLOT_ROWS as u16 / 2 + 1),
+                Constraint::Length(1),
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
             .split(area);
             let header = Layout::horizontal([
-                Constraint::Length(1),
                 Constraint::Length(9),
+                Constraint::Length(2),
                 Constraint::Length(57),
                 Constraint::Min(0),
             ])
@@ -1126,7 +1128,7 @@ fn main() -> io::Result<()> {
             );
 
             let body = Layout::horizontal([Constraint::Length(32), Constraint::Min(0)])
-                .split(rows[1]);
+                .split(rows[2]);
             let menu_cols: [Rect; 2] =
                 Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(
                     box_title(f, body[0], "commands", CY),
@@ -1185,12 +1187,12 @@ fn main() -> io::Result<()> {
             // footer
             f.render_widget(
                 Block::default().style(Style::new().bg(DARK)),
-                rows[2],
+                rows[3],
             );
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(FOOT, st(GRAY))))
                     .style(Style::new().bg(DARK)),
-                rows[2],
+                rows[3],
             );
             let status_text = match (&app.spinner, &app.app_action) {
                 (Some(line), _) => format!("{line}… "),
@@ -1204,7 +1206,7 @@ fn main() -> io::Result<()> {
                 )))
                 .style(Style::new().bg(DARK))
                 .alignment(ratatui::layout::Alignment::Right),
-                rows[2],
+                rows[3],
             );
 
             // dialog overlay (last = on top)
@@ -1213,9 +1215,9 @@ fn main() -> io::Result<()> {
                     DialogKind::Pick { items, .. } => {
                         let width = (57.min(area.width.saturating_sub(4))).max(20);
                         let height =
-                            (items.len() as u16 + 5).min(rows[1].height.saturating_sub(2));
+                            (items.len() as u16 + 5).min(rows[2].height.saturating_sub(2));
                         let x = area.x + (area.width.saturating_sub(width)) / 2;
-                        let y = rows[1].y + (rows[1].height.saturating_sub(height)) / 2;
+                        let y = rows[2].y + (rows[2].height.saturating_sub(height)) / 2;
                         let inner = box_title(f, Rect { x, y, width, height }, &dlog.title, YEL);
                         hit_dialog_list = inner;
                         let sel_now = match &dlog.kind {
@@ -1243,9 +1245,9 @@ fn main() -> io::Result<()> {
                             format!("{buffer}▮")
                         };
                         let width = 46.min(area.width.saturating_sub(4)).max(24);
-                        let height = 5.min(rows[1].height.saturating_sub(2));
+                        let height = 5.min(rows[2].height.saturating_sub(2));
                         let x = area.x + (area.width.saturating_sub(width)) / 2;
-                        let y = rows[1].y + (rows[1].height.saturating_sub(height)) / 2;
+                        let y = rows[2].y + (rows[2].height.saturating_sub(height)) / 2;
                         let inner = box_title(f, Rect { x, y, width, height }, &dlog.title, YEL);
                         hit_dialog_list = inner;
                         let dims: [Rect; 2] =
