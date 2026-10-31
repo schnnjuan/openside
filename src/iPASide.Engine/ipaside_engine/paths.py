@@ -12,6 +12,10 @@ import os
 import sys
 from pathlib import Path
 
+# Keep the on-disk state under the legacy name for now. Renaming the package
+# later must not orphan the anisette cache, Apple sessions, signing material,
+# sideload registry, tweaks, downloads etc. Use an env override if that really
+# needs to come back.
 APP_NAME = "iPASide"
 
 

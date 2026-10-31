@@ -1,0 +1,17 @@
+[package]
+name = "openside-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal front-end for the OpenSide engine (Python side, Rust TUI)."
+license = "MIT"
+repository = "https://github.com/pwnapplehat/OpenSide"
+readme = "README.md"
+
+[dependencies]
+ratatui = "0.30.2"
+crossterm = "0.30"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+assert_cmd = "2"

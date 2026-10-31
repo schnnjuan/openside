@@ -9,10 +9,12 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime
+import difflib
 import getpass
 import io
 import json
 import os
+import re
 import sys
 import threading
 from pathlib import Path
@@ -42,7 +44,331 @@ from . import (
 )
 from .errors import EngineError
 
-_STATUS_GLYPH = {"ok": "[ OK ]", "warn": "[WARN]", "fail": "[FAIL]"}
+# --------------------------------------------------------------------------- #
+# Pretty human output
+#
+# A small Ollama/OpenCode-style status layer for the human path of the CLI:
+# an animated spinner line for long phases, and ✓/✗ result lines. The --json
+# path (which the desktop shell uses) never runs this code, and when stdout or
+# stderr is piped the colours and spinner degrade to plain text lines.
+# --------------------------------------------------------------------------- #
+
+_TTY = sys.stdout.isatty() and sys.stderr.isatty()
+if _TTY and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb":
+    _C_RESET, _C_DIM, _C_BOLD = "\x1b[0m", "\x1b[2m", "\x1b[1m"
+    _C_CYAN, _C_GREEN, _C_RED, _C_YELLOW = "\x1b[36m", "\x1b[32m", "\x1b[31m", "\x1b[33m"
+else:
+    _C_RESET = _C_DIM = _C_BOLD = _C_CYAN = _C_GREEN = _C_RED = _C_YELLOW = ""
+
+# Friendly names for the phases the engine reports; anything unmapped is shown
+# as-is, capitalised.
+_PHASE_LABELS = {
+    "provision": "Provisioning",
+    "sign": "Signing",
+    "install": "Installing",
+    "upload": "Uploading",
+    "download": "Downloading",
+    "read": "Reading IPA",
+    "extract": "Extracting",
+    "finalize": "Wrapping up",
+}
+
+# Apple service errors where the fix is a command the user can run right now.
+_ERROR_HINTS = (
+    ("7460",
+     "Apple thinks another certificate request is pending. Run `slots` to list "
+     "your certificates and `revoke-cert <serial>` to free the stale one."),
+)
+
+
+def _hint_for(message: str) -> str | None:
+    for needle, hint in _ERROR_HINTS:
+        if needle in message:
+            return hint
+    return None
+
+
+class _PrettyProgress:
+    """One animated status line, shared by every human-mode progress callback.
+
+    Each callback just calls ``emit``; a daemon timer redraws the spinner
+    between callbacks so the line keeps breathing during silent stretches.
+    """
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+        self._lock = threading.Lock()
+        self._timer: threading.Timer | None = None
+        self._active = False
+        self._frame = 0
+        self._label = ""
+        self._detail = ""
+        self._percent: int | float | None = None
+        self._last_label: str | None = None
+
+    def emit(self, phase: Any, percent: Any = None, step: Any = None) -> None:
+        label = _PHASE_LABELS.get(phase) or (str(phase).capitalize() if phase else "Working")
+        with self._lock:
+            self._label = label
+            self._detail = str(step or "")
+            self._percent = percent if isinstance(percent, (int, float)) else None
+            phase_changed = self._label != self._last_label
+            self._last_label = label
+            if not self._active:
+                self._active = True
+                self._frame = 0
+            if _TTY:
+                self._draw()
+                self._ensure_timer()
+            elif phase_changed:
+                # Piped: one plain line per phase, never per percent tick,
+                # so a captured log shows phases, not a waterfall of updates.
+                text = f"{self._label}…"
+                if self._detail:
+                    text += f" {self._detail}"
+                if self._percent is not None:
+                    text = f"{int(self._percent)}% {text}"
+                print(text, file=self._stream, flush=True)
+
+    def stop(self) -> None:
+        with self._lock:
+            timer, self._timer, self._active = self._timer, None, False
+        if timer:
+            timer.cancel()
+
+    def erase(self) -> None:
+        self.stop()
+        if _TTY:
+            try:
+                self._stream.write("\r\x1b[2K")
+                self._stream.flush()
+            except (OSError, ValueError):
+                pass
+
+    _BAR_W = 24
+
+    def _determinate(self) -> str:
+        filled = max(0, min(self._BAR_W, int(self._percent / 100 * self._BAR_W)))
+        return f"{_C_CYAN}{'█' * filled}{_C_RESET}{_C_DIM}{'░' * (self._BAR_W - filled)}{_C_RESET}"
+
+    def _indeterminate(self) -> str:
+        # No percent from Apple (provision): a 5-cell block sweeping the bar.
+        seg = 5
+        pos = self._frame % max(1, self._BAR_W - seg + 1)
+        return (f"{_C_DIM}{'░' * pos}{_C_RESET}{_C_CYAN}{'█' * seg}{_C_RESET}"
+                f"{_C_DIM}{'░' * (self._BAR_W - seg - pos)}{_C_RESET}")
+
+    def _draw(self) -> None:
+        if not _TTY:
+            return
+        frame = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[self._frame % 10]
+        bar = self._determinate() if self._percent is not None else self._indeterminate()
+        line = f"{_C_CYAN}{frame}{_C_RESET} {_C_BOLD}{self._label}{_C_RESET}  {bar}"
+        if self._percent is not None:
+            line += f"  {_C_BOLD}{int(self._percent)}%{_C_RESET}"
+        if self._detail:
+            line += f"  {_C_DIM}{self._detail}{_C_RESET}"
+        try:
+            self._stream.write("\r\x1b[2K" + line)
+            self._stream.flush()
+        except (OSError, ValueError):
+            return  # stderr closed mid-run; nothing to draw on
+
+    def _ensure_timer(self) -> None:
+        if self._timer is None:
+            self._timer = threading.Timer(0.12, self._tick)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _tick(self) -> None:
+        with self._lock:
+            self._timer = None
+            if not self._active:
+                return
+            self._frame += 1
+            self._draw()
+            self._ensure_timer()
+
+
+_PROGRESS = _PrettyProgress(sys.stderr)
+
+
+def _settle() -> None:
+    """Stop the spinner and clear its line before printing a result line."""
+    _PROGRESS.erase()
+
+
+def _ok(text: str) -> None:
+    _settle()
+    print(f"{_C_GREEN}✓{_C_RESET} {text}", flush=True)
+
+
+def _note(text: str) -> None:
+    print(f"{_C_DIM}  {text}{_C_RESET}", flush=True)
+
+
+# Slash-style menu: what `ipaside` shows with no arguments. Short, curated
+# descriptions for exactly every subcommand that exists (verified against
+# _HANDLERS by a test), so the menu can't promise a command that doesn't run.
+_MENU_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Getting started", (
+        "doctor", "devices", "device-info", "login",
+    )),
+    ("The main event", (
+        "sideload", "installs", "refresh", "signed",
+    )),
+    ("Apple ID slots", (
+        "teams", "provision", "sign", "slots", "delete-app-id", "revoke-cert",
+    )),
+    ("Device extras", (
+        "developer-mode", "pairing", "livecontainer", "jailbreak",
+    )),
+    ("IPA tooling", (
+        "inspect", "prepare", "resolve-tweak", "apps", "install", "uninstall",
+        "app-icons",
+    )),
+    ("Infrastructure", (
+        "anisette", "apple-support", "forget", "version", "serve",
+    )),
+)
+
+_MENU_HELP = {
+    "doctor": "check this PC is ready to sideload",
+    "devices": "list connected iPhones (USB / Wi-Fi)",
+    "device-info": "details for one connected device",
+    "login": "sign in to an Apple ID (or --code, --status)",
+    "sideload": "sign + install an .ipa, one shot",
+    "installs": "what is sideloaded + days until expiry",
+    "refresh": "re-sign + reinstall expiring apps",
+    "signed": "kept signed .ipas (or --clean)",
+    "teams": "development teams on the Apple ID",
+    "provision": "register the device + mint signing assets",
+    "sign": "sign an .ipa into a new file",
+    "slots": "certificates / app IDs / devices in the slot",
+    "delete-app-id": "free one app-ID identifier",
+    "revoke-cert": "free a signing certificate",
+    "developer-mode": "show or enable Developer Mode",
+    "pairing": "manage + deliver the pairing file",
+    "livecontainer": "install / inspect LiveContainer + guests",
+    "jailbreak": "advise or install Dopamine",
+    "inspect": "read an .ipa's metadata + encryption",
+    "prepare": "pre-process an .ipa before signing",
+    "resolve-tweak": "dylibs inside a .deb/.dylib",
+    "apps": "installed apps on the device",
+    "install": "install an already-signed .ipa",
+    "uninstall": "remove an app by bundle id",
+    "app-icons": "home-screen icons of installed apps",
+    "anisette": "anisette status or headers",
+    "apple-support": "Apple USB device-support status",
+    "forget": "drop one sideload record",
+    "version": "print the engine version",
+    "serve": "persistent engine server (for the desktop app)",
+}
+
+
+# Check-style marks for status reports (doctor, pairing status, ...).
+_CHECK_MARK = {
+    "ok": f"{_C_GREEN}✓{_C_RESET}",
+    "warn": f"{_C_YELLOW}!{_C_RESET}",
+    "fail": f"{_C_RED}✗{_C_RESET}",
+}
+_CHECK_DIM = f"{_C_DIM}·{_C_RESET}"
+
+# The wordmark: lowercase pixel-art glyphs in the same family as the
+# "ratscope" wordmark, rendered with half-block cells (▀/▄) so each cell is
+# two pixels tall. Color ramps light cyan -> dark cyan so the mark reads as
+# depth, not noise. Only drawn on a real terminal; piped logs never see it.
+_PIXEL_GLYPHS = {
+    "i": (".####.", "..##..", "..##..", "..##..", "..##..", "..##..", "..##..", ".####."),
+    "p": ("#####.", "##..##", "##..##", "##..##", "#####.", "##....", "##....", "##....", "##....", "##...."),
+    "a": (".####.", "....##", "....##", ".####.", "##..##", "##..##", "##..##", ".####."),
+    "s": (".#####", "##....", "##....", ".####.", "....##", "....##", "....##", "#####."),
+    "d": (".####.", "##..##", "##..##", "##..##", "##..##", "##..##", "##..##", ".####."),
+    "e": (".####.", "##..##", "##..##", "######", "##....", "##....", "##..##", ".####."),
+}
+
+
+def _pixel_grid(word: str) -> list[str]:
+    width = len(word) * 6 + (len(word) - 1) * 1
+    rows = max(len(_PIXEL_GLYPHS[ch]) for ch in word)
+    grid = [" " * width for _ in range(rows)]
+    x = 0
+    for ch in word:
+        glyph = _PIXEL_GLYPHS[ch]
+        for y, row in enumerate(glyph):
+            grid[y] = grid[y][:x] + row + grid[y][x + len(row):]
+        x += 7
+    return grid
+
+
+def _print_banner() -> None:
+    if not _TTY:
+        return
+    grid = _pixel_grid("ipaside")
+    pairs = (len(grid) + 1) // 2
+    ramp = ("51", "48", "45", "42", "39")
+    lines = []
+    for pair in range(pairs):
+        top_row = grid[pair * 2]
+        bot_row = grid[pair * 2 + 1] if pair * 2 + 1 < len(grid) else " " * len(top_row)
+        color = f"\x1b[38;5;{ramp[pair % len(ramp)]}m"
+        cells = []
+        for top, bottom in zip(top_row, bot_row):
+            t_on, b_on = top != " ", bottom != " "
+            if t_on and b_on:
+                cells.append(f"\x1b[38;5;{ramp[pair % len(ramp)]}m\x1b[48;5;{ramp[min(pair + 1, len(ramp) - 1)]}m▀")
+            elif t_on:
+                cells.append("▀")
+            elif b_on:
+                cells.append("▄")
+            else:
+                cells.append(" ")
+        lines.append(f"{color}{''.join(cells)}\x1b[0m")
+    for line in lines:
+        print(line)
+    print(f"  {_C_DIM}iOS sideloading · v{__version__}{_C_RESET}\n")
+
+
+
+def _fail(title: str, detail: Any = None, hint: str | None = None) -> None:
+    _settle()
+    print(f"{_C_RED}✗{_C_RESET} {_C_BOLD}{title}{_C_RESET}", flush=True)
+    if detail is not None and str(detail):
+        for line in str(detail).splitlines():
+            print(f"  {line}", flush=True)
+    if hint:
+        print(f"{_C_DIM}  hint: {hint}{_C_RESET}", flush=True)
+
+
+def _print_menu() -> int:
+    """The slash-style palette `ipaside` shows when no command is given."""
+    _print_banner()
+    for group, names in _MENU_GROUPS:
+        print(f"  {_C_BOLD}{group}{_C_RESET}")
+        for name in names:
+            print(f"    {name:<16} {_C_DIM}{_MENU_HELP.get(name, '')}{_C_RESET}")
+    print(f"\n  {_C_DIM}details:  ipaside <command> --help   ·   quick start:"
+          f" ipaside login, then ipaside sideload <file>.ipa{_C_RESET}")
+    return 0
+
+
+class _RootParser(argparse.ArgumentParser):
+    """Root parser that adds a 'did you mean' hint for unknown subcommands."""
+
+    subcommands: list[str] = []
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        match = re.search(r"invalid choice: '([^']+)'", message)
+        candidates = (
+            difflib.get_close_matches(match.group(1), self.subcommands, 3, 0.4)
+            if match else []
+        )
+        if candidates:
+            message = (
+                f"unknown command '{match.group(1)}'\n\n  did you mean:\n"
+                + "".join(f"      {c}\n" for c in candidates)
+            )
+        self.exit(2, f"{self.prog}: error: {message}\n")
 
 # SideStore runs an iOS Shortcut by this exact name after a refresh, to drop the local
 # tunnel it needed. The name is hardcoded in SideStore, and when no such Shortcut exists
@@ -104,15 +430,14 @@ def _emit(args: argparse.Namespace, payload: Any) -> None:
 
 
 def _print_doctor(report: dict[str, Any]) -> None:
-    print("iPASide doctor")
-    print("=" * 60)
+    print(f"{_C_BOLD}iPASide doctor{_C_RESET}")
     for check in report["checks"]:
-        glyph = _STATUS_GLYPH.get(check["status"], "[    ]")
-        print(f"{glyph}  {check['name']}")
-        print(f"        {check['detail']}")
-    print("=" * 60)
+        glyph = _CHECK_MARK.get(check["status"], _CHECK_DIM)
+        print(f"  {glyph}  {check['name']}")
+        print(f"      {_C_DIM}{check['detail']}{_C_RESET}")
     overall = report["overall"]
-    print(f"Overall: {_STATUS_GLYPH.get(overall, '')} {overall.upper()}")
+    glyph = _CHECK_MARK.get(overall, overall)
+    print(f"\n  {glyph}  overall: {overall}")
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
@@ -130,14 +455,15 @@ def _cmd_devices(args: argparse.Namespace) -> int:
         _emit(args, devices)
         return 0
     if not devices:
-        print("No iOS devices visible. Plug in via USB, unlock, and tap 'Trust'.")
+        _note("No iOS devices visible. Plug in via USB, unlock, and tap 'Trust'.")
         return 0
+    conn_tty = isinstance(devices[0].get("connection_type"), str)
     for dev in devices:
-        print(
-            f"{dev.get('serial', '?')}  "
-            f"{dev.get('connection_type', '?')}  "
-            f"(id={dev.get('device_id', '?')})"
-        )
+        conn = str(dev.get("connection_type", "?"))
+        mark = _CHECK_MARK.get("ok", "") if conn.lower() == "usb" else _CHECK_DIM
+        print(f"  {mark}  {conn:<5} {_C_BOLD}{dev.get('serial', '?')}{_C_RESET}  "
+              f"{_C_DIM}(id={dev.get('device_id', '?')}){_C_RESET}")
+    print(f"\n  {_C_DIM}{len(devices)} device(s){_C_RESET}")
     return 0
 
 
@@ -147,9 +473,11 @@ def _cmd_device_info(args: argparse.Namespace) -> int:
         _emit(args, info)
     else:
         if not info:
-            print("No device info available (is a device connected and trusted?).")
+            _note("No device info available (is a device connected and trusted?).")
+            return 0
+        width = max(len(str(key)) for key in info)
         for key, value in info.items():
-            print(f"{key}: {value}")
+            print(f"  {_C_DIM}{str(key):<{width}}{_C_RESET} {value}")
     return 0
 
 
@@ -159,13 +487,15 @@ def _cmd_apps(args: argparse.Namespace) -> int:
         _emit(args, installed)
         return 0
     if not installed:
-        print("No apps found.")
+        _note("No apps found.")
         return 0
+    names = [str(meta.get("name") or "") for meta in installed.values()]
+    width = max(map(len, names), default=16)
     for bundle_id, meta in sorted(installed.items()):
-        name = meta.get("name") or ""
-        version = meta.get("version") or ""
-        print(f"{bundle_id:<45} {name}  {version}")
-    print(f"\n{len(installed)} app(s).")
+        name = str(meta.get("name") or "")
+        version = str(meta.get("version") or "")
+        print(f"  {name:<{width}}  {_C_CYAN}{version}{_C_RESET}  {_C_DIM}{bundle_id}{_C_RESET}")
+    print(f"\n  {_C_DIM}{len(installed)} app(s){_C_RESET}")
     return 0
 
 
@@ -176,13 +506,13 @@ def _cmd_developer_mode(args: argparse.Namespace) -> int:
             if args.json:
                 _emit(args, {"ok": False, "reason": msg})
             else:
-                print(msg)
+                _fail("Developer Mode not enabled", "--yes required (this reboots the device)")
             return 2
         result = developer_mode.enable(args.udid)
         if args.json:
             _emit(args, result)
         else:
-            print(result.get("note", "Developer Mode enable triggered."))
+            _ok(result.get("note", "Developer Mode enable triggered."))
         return 0
 
     state = developer_mode.status(args.udid)
@@ -190,12 +520,16 @@ def _cmd_developer_mode(args: argparse.Namespace) -> int:
         _emit(args, state)
     else:
         enabled = state.get("enabled")
-        label = {True: "enabled", False: "disabled", None: "unknown"}.get(enabled, "unknown")
+        label = {
+            True: f"{_C_GREEN}enabled{_C_RESET}",
+            False: f"{_C_RED}disabled{_C_RESET}",
+            None: f"{_C_DIM}unknown{_C_RESET}",
+        }.get(enabled, "unknown")
         print(f"Developer Mode: {label}")
         if state.get("reason"):
-            print(f"  {state['reason']}")
+            _note(state["reason"])
         if state.get("product_version"):
-            print(f"  iOS {state['product_version']}")
+            _note(f"iOS {state['product_version']}")
     return 0
 
 
@@ -211,14 +545,13 @@ def _cmd_install(args: argparse.Namespace) -> int:
             print(json.dumps({"event": "progress", "phase": phase, "percent": percent, "status": status}),
                   file=sys.stderr, flush=True)
         else:
-            print(f"  {percent if percent is not None else '?'}%  {label}",
-                  file=sys.stderr, flush=True)
+            _PROGRESS.emit(phase, percent, label)
 
     apps.install(args.ipa, args.udid, progress=progress)
     if args.json:
         _emit(args, {"ok": True, "installed": args.ipa})
     else:
-        print("Install complete.")
+        _ok("Install complete.")
     return 0
 
 
@@ -228,10 +561,10 @@ def _cmd_app_icons(args: argparse.Namespace) -> int:
         _emit(args, found)
         return 0
     if not found:
-        print("No icons available.")
+        _note("No icons available.")
         return 0
     for bundle_id in sorted(found):
-        print(f"{bundle_id}  ({len(found[bundle_id])} chars)")
+        print(f"  {_C_DIM}{bundle_id}  ({len(found[bundle_id])} chars){_C_RESET}")
     return 0
 
 
@@ -240,7 +573,7 @@ def _cmd_uninstall(args: argparse.Namespace) -> int:
     if args.json:
         _emit(args, {"ok": True, "uninstalled": args.bundle_id})
     else:
-        print(f"Uninstalled {args.bundle_id}.")
+        _ok(f"Uninstalled {args.bundle_id}")
     return 0
 
 
@@ -261,9 +594,13 @@ def _cmd_anisette(args: argparse.Namespace) -> int:
     if args.json:
         _emit(args, state)
     else:
-        print(f"Anisette package: {state['package_version'] or 'NOT INSTALLED'}")
-        print(f"Provisioning state cached: {state['state_cached']}")
-        print(f"  {state['state_path']}")
+        pkg = str(state["package_version"] or "")
+        if pkg:
+            print(f"  {_C_GREEN}✓{_C_RESET} Anisette {_C_CYAN}{pkg}{_C_RESET}")
+        else:
+            print(f"  {_C_RED}✗{_C_RESET} Anisette not installed")
+        print(f"  {_C_DIM}provisioning state cached: {state['state_cached']}")
+        print(f"  {state['state_path']}{_C_RESET}")
     return 0
 
 
@@ -275,14 +612,14 @@ def _cmd_apple_support(args: argparse.Namespace) -> int:
     the engine hands back a path it has proved is Apple's, and the app launches it.
     """
     if args.download:
-        result = apple_support.download_itunes(args.dir, on_progress=_progress_to_stderr())
+        result = apple_support.download_itunes(args.dir, on_progress=_progress_to_stderr(json_mode=args.json))
         if args.json:
             _emit(args, result)
         else:
-            print("Downloaded and verified Apple's iTunes installer.")
+            _ok("Downloaded and verified Apple's iTunes installer.")
             print(f"  file:   {result['path']} ({_mb(result['bytes'])})")
             print(f"  signer: {result['signer']}")
-            print("  Run it to install Apple Mobile Device Service.")
+            _note("Run it to install Apple Mobile Device Service.")
         return 0
 
     if args.start_service:
@@ -290,8 +627,10 @@ def _cmd_apple_support(args: argparse.Namespace) -> int:
         if args.json:
             _emit(args, result)
         else:
-            outcome = "started" if result["started"] else "not started"
-            print(f"Apple Mobile Device Service: {outcome}")
+            if result["started"]:
+                _ok("Apple Mobile Device Service started")
+            else:
+                _fail("Apple Mobile Device Service not started")
             print(f"  {result['detail']}")
         return 0
 
@@ -299,11 +638,14 @@ def _cmd_apple_support(args: argparse.Namespace) -> int:
     if args.json:
         _emit(args, report)
         return 0
-    print(f"Apple device support: {report['state']}")
-    print(f"  {report['detail']}")
+    state = str(report["state"])
+    mark = _CHECK_MARK.get("ok", "") if state == "ready" else _CHECK_MARK.get("warn", "")
+    print(f"  {mark}  Apple device support: {state}")
+    print(f"      {_C_DIM}{report['detail']}{_C_RESET}")
     if report["itunes_installed"]:
         version = report["itunes_version"]
-        print(f"  iTunes {version} is installed" if version else "  iTunes is installed")
+        label = f"iTunes {version} installed" if version else "iTunes installed"
+        print(f"      {_C_DIM}{label}{_C_RESET}")
     return 0
 
 
@@ -313,14 +655,12 @@ def _cmd_teams(args: argparse.Namespace) -> int:
         _emit(args, teams)
         return 0
     if not teams:
-        print("No development teams found for this account.")
+        _note("No development teams found for this account.")
         return 0
     for team in teams:
-        print(
-            f"{team.get('teamId')}  {team.get('name')}  "
-            f"({team.get('type')}, status={team.get('status')})"
-        )
-    print(f"{len(teams)} team(s).")
+        print(f"  {_C_BOLD}{team.get('teamId')}{_C_RESET}  {team.get('name')}  "
+              f"{_C_DIM}({team.get('type')}, status={team.get('status')}){_C_RESET}")
+    print(f"\n  {_C_DIM}{len(teams)} team(s){_C_RESET}")
     return 0
 
 
@@ -333,7 +673,7 @@ def _cmd_provision(args: argparse.Namespace) -> int:
         if args.json:
             _emit(args, {"status": "error", "error": str(exc)})
         else:
-            print(f"error: {exc}")
+            _fail("Device error", exc)
         return 2
 
     try:
@@ -347,13 +687,13 @@ def _cmd_provision(args: argparse.Namespace) -> int:
         if args.json:
             _emit(args, {"status": "error", "error": str(exc)})
         else:
-            print(f"Provisioning failed: {exc}")
+            _fail("Provisioning failed", exc)
         return 1
 
     if args.json:
         _emit(args, bundle)
     else:
-        print(f"Provisioned signing assets for {bundle['bundle_id']}")
+        _ok(f"Provisioned signing assets for {bundle['bundle_id']}")
         print(f"  team:        {bundle['team_name']} ({bundle['team_id']})")
         print(f"  device:      {bundle['udid']}")
         print(f"  App ID:      {bundle['app_id_id']}")
@@ -381,23 +721,26 @@ def _cmd_sign(args: argparse.Namespace) -> int:
         if args.json:
             _emit(args, {"status": "error", "error": str(exc)})
         else:
-            print(f"Signing failed: {exc}")
+            _fail("Signing failed", exc)
         return 1
 
     if args.json:
         _emit(args, {"status": "signed", "output": result["output"]})
     else:
-        print(f"Signed -> {result['output']}")
+        _ok(f"Signed → {result['output']}")
     return 0
 
 
-def _progress_to_stderr(bundle_id: str | None = None):
-    """Return an on_progress callback that streams JSON progress events on stderr."""
+def _progress_to_stderr(bundle_id: str | None = None, json_mode: bool = True):
+    """--json: NDJSON progress events on stderr; human: animated status line."""
     def emit(phase_name: str, percent: Any = None, step: str | None = None) -> None:
-        event = {"event": "progress", "phase": phase_name, "percent": percent, "step": step}
-        if bundle_id:
-            event["bundle_id"] = bundle_id
-        print(json.dumps(event), file=sys.stderr, flush=True)
+        if json_mode:
+            event = {"event": "progress", "phase": phase_name, "percent": percent, "step": step}
+            if bundle_id:
+                event["bundle_id"] = bundle_id
+            print(json.dumps(event), file=sys.stderr, flush=True)
+        else:
+            _PROGRESS.emit(phase_name, percent, step)
     return emit
 
 
@@ -410,8 +753,218 @@ _SIDELOAD_ERRORS = (
 )
 
 
+def _candidate_ipas(root: Path | None = None) -> list[Path]:
+    """IPAs in the usual places (and one level deeper under projects/).
+
+    Roots can be overridden/augmented with ``IPASIDE_IPA_DIRS`` (os.pathsep
+    separated) so the scan follows wherever the user keeps their IPAs.
+    """
+    if root is not None:
+        roots = [root]
+        depth = 1
+    else:
+        env = os.environ.get("IPASIDE_IPA_DIRS")
+        if env:
+            roots = [Path(p).expanduser() for p in env.split(os.pathsep) if p.strip()]
+        else:
+            roots = [Path.cwd(), Path.home() / "Downloads", Path.home() / "Desktop",
+                     Path.home() / "Documents"]
+        depth = 2
+    seen: set[Path] = set()
+    found: list[Path] = []
+    stack = [(r, 0) for r in roots if r.is_dir()]
+    while stack:
+        current, level = stack.pop()
+        try:
+            entries = list(current.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_file() and entry.suffix.lower() == ".ipa":
+                try:
+                    key = entry.resolve()
+                except OSError:
+                    continue
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(entry)
+            elif entry.is_dir() and level < depth:
+                stack.append((entry, level + 1))
+    found.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    return found[:40]
+
+
+def _browse_for_ipa(start: Path | None = None) -> str | None:
+    """A tiny interactive file browser for picking an .ipa without a GUI dialog."""
+    current = (start or Path.home()).expanduser().resolve()
+    while True:
+        try:
+            entries = sorted(current.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        except OSError as exc:
+            _fail("Cannot read folder", exc)
+            return None
+        dirs = [p for p in entries if p.is_dir() and not p.name.startswith(".")]
+        ipas = [p for p in entries if p.is_file() and p.suffix.lower() == ".ipa"]
+        shown = []
+        if current.parent != current:
+            shown.append(("..", current.parent, "dir"))
+        for p in dirs[:60]:
+            shown.append((p.name + "/", p, "dir"))
+        for p in ipas:
+            shown.append((p.name, p, "ipa"))
+        print(f"\n{_C_BOLD}{current}{_C_RESET}")
+        if not shown:
+            _note("empty folder")
+        for index, (label, _path, kind) in enumerate(shown, 1):
+            mark = _C_DIM if kind == "dir" else _C_GREEN
+            print(f"  {index:>2}) {mark}{label}{_C_RESET}")
+        print(f"  {_C_DIM}type a path to jump, or q to quit{_C_RESET}")
+        try:
+            raw = input(f"{_C_DIM}> {_C_RESET}").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if raw.lower() in ("q", "quit", "exit"):
+            return None
+        if raw == "":
+            continue
+        # direct path typed
+        if raw.startswith("/") or raw.startswith("~") or raw.startswith("."):
+            candidate = Path(raw).expanduser()
+            if candidate.is_file() and candidate.suffix.lower() == ".ipa":
+                return str(candidate.resolve())
+            if candidate.is_dir():
+                current = candidate.resolve()
+                continue
+            _note("not a folder or .ipa")
+            continue
+        if raw.isdigit() and 1 <= int(raw) <= len(shown):
+            label, path, kind = shown[int(raw) - 1]
+            if kind == "ipa":
+                return str(path.resolve())
+            current = path.resolve()
+            continue
+        _note("invalid choice")
+
+
+def _pick_ipa_interactively() -> str | None:
+    candidates = _candidate_ipas()
+    if not candidates:
+        _note("No .ipa found in the usual places.")
+        try:
+            raw = input(f"{_C_DIM}browse? [Y/n] or paste a path:{_C_RESET} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if raw.lower() in ("n", "no"):
+            return None
+        if raw.lower() in ("", "y", "yes"):
+            return _browse_for_ipa()
+        return str(Path(raw).expanduser())
+    print(f"{_C_BOLD}Choose an .ipa to sideload{_C_RESET}")
+    for index, path in enumerate(candidates, 1):
+        try:
+            when = datetime.datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
+        except OSError:
+            when = ""
+        print(f"  {index:>2}) {path.name}  {_C_DIM}{path.parent}  {when}{_C_RESET}")
+    while True:
+        try:
+            raw = input(f"{_C_DIM}number (Enter = 1, q = quit):{_C_RESET} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if raw.lower() in ("q", "quit", "exit"):
+            return None
+        if raw == "":
+            return str(candidates[0])
+        if raw.isdigit() and 1 <= int(raw) <= len(candidates):
+            return str(candidates[int(raw) - 1])
+        _note("invalid choice")
+
+
+def _pick_device_interactively() -> str | None:
+    entries = device.list_devices()
+    udids: list[str] = []
+    for entry in entries:
+        serial = entry.get("serial")
+        if serial and str(serial) not in udids:
+            udids.append(str(serial))
+    if not udids:
+        _fail("No device connected", "connect an iPhone (or pass --udid)")
+        return None
+    if len(udids) == 1:
+        return udids[0]
+    print(f"{_C_BOLD}Choose a device{_C_RESET}")
+    for index, serial in enumerate(udids, 1):
+        kinds = ", ".join(
+            str(e.get("connection_type")) for e in entries if e.get("serial") == serial
+        )
+        print(f"  {index:>2}) {serial}  {_C_DIM}{kinds}{_C_RESET}")
+    while True:
+        try:
+            raw = input(f"{_C_DIM}number (Enter = 1, q = quit):{_C_RESET} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if raw.lower() in ("q", "quit", "exit"):
+            return None
+        if raw == "":
+            return udids[0]
+        if raw.isdigit() and 1 <= int(raw) <= len(udids):
+            return udids[int(raw) - 1]
+        _note("invalid choice")
+
+
 def _cmd_sideload(args: argparse.Namespace) -> int:
     """One-shot: provision -> sign -> install, streaming phases/progress on stderr."""
+    if not args.ipa:
+        if args.json or not sys.stdin.isatty():
+            _fail("Missing IPA", "pass an .ipa path, e.g. ipaside sideload app.ipa")
+            return 2
+        chosen = _pick_ipa_interactively()
+        if not chosen:
+            return 1
+        args.ipa = chosen
+    # A directory means "pick an .ipa inside it".
+    if Path(args.ipa).is_dir():
+        candidates = _candidate_ipas(Path(args.ipa))
+        if not candidates:
+            _fail("No .ipa in that folder", args.ipa)
+            return 1
+        if not sys.stdin.isatty():
+            args.ipa = str(candidates[0])
+        else:
+            print(f"{_C_BOLD}Choose an .ipa in {args.ipa}{_C_RESET}")
+            for index, path in enumerate(candidates, 1):
+                print(f"  {index:>2}) {path.name}")
+            while True:
+                try:
+                    raw = input(f"{_C_DIM}number (Enter = 1):{_C_RESET} ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    return 1
+                if raw == "":
+                    args.ipa = str(candidates[0]); break
+                if raw.isdigit() and 1 <= int(raw) <= len(candidates):
+                    args.ipa = str(candidates[int(raw)-1]); break
+                _note("invalid choice")
+    if not args.udid and not args.json and sys.stdin.isatty():
+        try:
+            devices = device.list_devices()
+        except Exception:  # noqa: BLE001
+            devices = []
+        udids = []
+        for entry in devices:
+            serial = entry.get("serial")
+            if serial and str(serial) not in udids:
+                udids.append(str(serial))
+        if len(udids) > 1:
+            chosen_dev = _pick_device_interactively()
+            if not chosen_dev:
+                return 1
+            args.udid = chosen_dev
     try:
         result = sideload.run_sideload(
             args.ipa,
@@ -428,20 +981,21 @@ def _cmd_sideload(args: argparse.Namespace) -> int:
             enable_file_sharing=args.enable_file_sharing,
             keep_signed=args.keep_signed,
             signed_dir=args.signed_dir,
-            on_progress=_progress_to_stderr(),
+            on_progress=_progress_to_stderr(json_mode=args.json),
         )
     except _SIDELOAD_ERRORS as exc:
         if args.json:
             _emit(args, {"status": "error", "error": str(exc)})
         else:
-            print(f"Sideload failed: {exc}")
+            _fail("Sideload failed", exc, _hint_for(str(exc)))
         return 1
 
     if args.json:
         _emit(args, result)
     else:
-        print(f"Sideloaded {result['name']} ({result['bundle_id']}). "
-              "Trust the developer on your device to launch it.")
+        _print_banner()
+        _ok(f"Sideloaded {result['name']} ({result['bundle_id']})")
+        _note("Trust the developer on your device to launch it.")
     return 0
 
 
@@ -461,13 +1015,13 @@ def _cmd_livecontainer(args: argparse.Namespace) -> int:
     if args.add:
         host = _livecontainer_host(args)
         result = livecontainer.install_guest(
-            args.add, host, args.udid, on_progress=_progress_to_stderr()
+            args.add, host, args.udid, on_progress=_progress_to_stderr(json_mode=args.json)
         )
         if args.json:
             _emit(args, result)
             return 0
-        print(f"Added {result['name']} to LiveContainer ({result['bundle_id']}).")
-        print(
+        _ok(f"Added {result['name']} to LiveContainer ({result['bundle_id']})")
+        _note(
             "It is not installed on the phone, so it uses none of your three app slots. "
             "Open LiveContainer and it will sign it on first launch."
         )
@@ -479,7 +1033,7 @@ def _cmd_livecontainer(args: argparse.Namespace) -> int:
         if args.json:
             _emit(args, {"status": "removed", "bundle_id": args.remove})
         else:
-            print(f"Removed {args.remove} from LiveContainer.")
+            _ok(f"Removed {args.remove} from LiveContainer")
         return 0
 
     if args.apps:
@@ -489,28 +1043,28 @@ def _cmd_livecontainer(args: argparse.Namespace) -> int:
             _emit(args, guests)
             return 0
         if not guests:
-            print("No apps inside LiveContainer yet. Add one with --add <ipa>.")
+            _note("No apps inside LiveContainer yet. Add one with --add <ipa>.")
             return 0
-        print(f"{len(guests)} app(s) inside LiveContainer, using no app slots:")
+        print(f"  {_C_BOLD}{len(guests)} app(s){_C_RESET} {_C_DIM}inside LiveContainer, using no app slots:{_C_RESET}")
         for guest in guests:
-            print(f"  {guest['bundle_id']}")
+            print(f"      {_C_DIM}{guest['bundle_id']}{_C_RESET}")
         return 0
 
     if args.download and not args.setup:
         result = livecontainer.download(
-            args.dir, variant=args.variant, on_progress=_progress_to_stderr()
+            args.dir, variant=args.variant, on_progress=_progress_to_stderr(json_mode=args.json)
         )
         if args.json:
             _emit(args, result)
         else:
-            print(f"Downloaded {result['asset_name']} ({result['version']}) to {result['path']}")
+            _ok(f"Downloaded {result['asset_name']} ({result['version']}) → {result['path']}")
         return 0
 
     if args.setup:
         ipa_path = args.ipa
         if not ipa_path:
             ipa_path = livecontainer.download(
-                args.dir, variant=args.variant, on_progress=_progress_to_stderr()
+                args.dir, variant=args.variant, on_progress=_progress_to_stderr(json_mode=args.json)
             )["path"]
         result = livecontainer.setup(
             ipa_path,
@@ -518,39 +1072,39 @@ def _cmd_livecontainer(args: argparse.Namespace) -> int:
             keep_signed=args.keep_signed,
             signed_dir=args.signed_dir,
             automatic_certificate=not args.manual_certificate,
-            on_progress=_progress_to_stderr(),
+            on_progress=_progress_to_stderr(json_mode=args.json),
         )
         if args.json:
             _emit(args, result)
             return 0
 
         certificate = result["certificate"]
-        print(f"Installed LiveContainer ({result['bundle_id']}).")
+        _ok(f"Installed LiveContainer ({result['bundle_id']})")
         if certificate.get("automatic"):
-            print(
+            _note(
                 "Open it once and it will import the signing certificate itself, "
                 "then JIT-less mode is ready."
             )
         elif certificate.get("seeded"):
-            print(certificate["instructions"])
+            _note(certificate["instructions"])
         else:
-            print(f"The certificate could not be delivered: {certificate.get('error')}")
-            print(certificate["instructions"])
+            _fail("The certificate could not be delivered", certificate.get("error"))
+            _note(certificate["instructions"])
 
         pairing = result.get("pairing") or {}
         if result.get("has_sidestore"):
             if pairing.get("paired"):
-                print(
+                _note(
                     "This build carries SideStore, and it has been given this PC's "
                     "pairing file, so it can refresh apps on the phone itself."
                 )
             else:
-                print(
+                _note(
                     "This build carries SideStore, but the pairing file could not be "
                     f"delivered ({pairing.get('error')}), so on-device refresh will not "
                     "work until it is."
                 )
-            print(f"  {SIDESTORE_SHORTCUT_NOTE}")
+            _note(SIDESTORE_SHORTCUT_NOTE)
         return 0
 
     result = livecontainer.status(args.udid)
@@ -559,19 +1113,21 @@ def _cmd_livecontainer(args: argparse.Namespace) -> int:
         return 0
 
     if not result["installed"]:
-        print("LiveContainer is not installed. Run with --setup to install it.")
+        _note("LiveContainer is not installed. Run with --setup to install it.")
         return 0
-    print(f"LiveContainer {result.get('version') or ''} ({result['bundle_id']})")
+    version = result.get("version") or ""
+    suffix = f" {version}" if version else ""
+    print(f"  {_C_BOLD}LiveContainer{suffix}{_C_RESET}  {_C_DIM}{result['bundle_id']}{_C_RESET}")
     if result.get("certificate_pending"):
-        print("  A certificate import is waiting; open LiveContainer to complete it.")
+        _note("A certificate import is waiting; open LiveContainer to complete it.")
     elif not result.get("launched"):
-        print("  Installed but never opened.")
+        _note("Installed but never opened.")
     else:
-        print("  Set up. Its certificate is stored in the shared app group.")
+        _note("Set up. Its certificate is stored in the shared app group.")
     guests = livecontainer.guest_apps(str(result["bundle_id"]), args.udid)
-    print(f"  {len(guests)} app(s) inside it, using no app slots.")
+    _note(f"{len(guests)} app(s) inside it, using no app slots.")
     for guest in guests:
-        print(f"      {guest['bundle_id']}")
+        print(f"      {_C_DIM}{guest['bundle_id']}{_C_RESET}")
     return 0
 
 
@@ -621,11 +1177,11 @@ def _cmd_jailbreak(args: argparse.Namespace) -> int:
     """
     try:
         if args.download and not args.install:
-            result = jailbreak.download(args.dir, on_progress=_progress_to_stderr())
+            result = jailbreak.download(args.dir, on_progress=_progress_to_stderr(json_mode=args.json))
             if args.json:
                 _emit(args, result)
             else:
-                print(f"Downloaded {result['asset_name']} ({result['version']}) to {result['path']}")
+                _ok(f"Downloaded {result['asset_name']} ({result['version']}) → {result['path']}")
             return 0
 
         if args.install:
@@ -639,13 +1195,13 @@ def _cmd_jailbreak(args: argparse.Namespace) -> int:
                 ipa_path=args.ipa,
                 keep_signed=args.keep_signed,
                 signed_dir=args.signed_dir,
-                on_progress=_progress_to_stderr(),
+                on_progress=_progress_to_stderr(json_mode=args.json),
             )
             if args.json:
                 _emit(args, result)
             else:
-                print(f"Installed {jailbreak.TOOL['name']} ({result['bundle_id']}).")
-                print(
+                _ok(f"Installed {jailbreak.TOOL['name']} ({result['bundle_id']})")
+                _note(
                     "Open it on your iPhone to run the jailbreak. iPASide will refresh it "
                     "before its 7-day profile expires."
                 )
@@ -664,7 +1220,7 @@ def _cmd_jailbreak(args: argparse.Namespace) -> int:
         if args.json:
             _emit(args, {"status": "error", "error": str(exc)})
         else:
-            print(f"Jailbreak command failed: {exc}")
+            _fail("Jailbreak command failed", exc)
         return 1
 
 
@@ -674,17 +1230,22 @@ def _cmd_installs(args: argparse.Namespace) -> int:
         _emit(args, records)
         return 0
     if not records:
-        print("No sideloaded apps recorded yet.")
+        _note("No sideloaded apps recorded yet.")
         return 0
+    width = max(len(str(r.get("name") or "?")) for r in records)
     for record in records:
         days = record.get("days_left")
+        name = str(record.get("name") or "?")
         if record.get("expired"):
-            state = "EXPIRED"
+            state = f"{_C_RED}expired{_C_RESET}"
         elif days is not None:
-            state = f"{days:g} days left"
+            days_s = f"{days:g}d left"
+            state = (f"{_C_RED}{days_s}{_C_RESET}" if days <= 2
+                     else f"{_C_DIM}{days_s}{_C_RESET}")
         else:
-            state = "unknown"
-        print(f"{record['bundle_id']:<45} {record.get('name', '')}  [{state}]")
+            state = f"{_C_DIM}unknown{_C_RESET}"
+        print(f"  {state:<10} {_C_BOLD}{name:<{width}}{_C_RESET}  {_C_DIM}{record['bundle_id']}{_C_RESET}")
+    print(f"\n  {_C_DIM}{len(records)} app(s) sideloaded{_C_RESET}")
     return 0
 
 
@@ -705,7 +1266,7 @@ def _cmd_refresh(args: argparse.Namespace) -> int:
         try:
             res = sideload.refresh_record(
                 entry,
-                on_progress=_progress_to_stderr(entry["bundle_id"]),
+                on_progress=_progress_to_stderr(entry["bundle_id"], json_mode=args.json),
                 keep_signed=args.keep_signed,
                 signed_dir=args.signed_dir,
             )
@@ -722,10 +1283,12 @@ def _cmd_refresh(args: argparse.Namespace) -> int:
         _emit(args, summary)
     else:
         if not results:
-            print("Nothing to refresh.")
+            _note("Nothing to refresh.")
         for res in results:
-            suffix = f" ({res['error']})" if res.get("error") else ""
-            print(f"{res['bundle_id']}: {res['status']}{suffix}")
+            if res["status"] == "installed":
+                _ok(f"Refreshed {res['bundle_id']}")
+            else:
+                _fail(f"Refresh failed - {res['bundle_id']}", res.get("error"))
     return 0
 
 
@@ -739,18 +1302,18 @@ def _cmd_signed(args: argparse.Namespace) -> int:
         if args.json:
             _emit(args, result)
         else:
-            print(f"Removed {result['removed']} signed IPA(s), freeing "
-                  f"{_mb(result['bytes_freed'])}, from {result['directory']}")
+            _ok(f"Removed {result['removed']} signed IPA(s), freed {_mb(result['bytes_freed'])}")
+            _note(result["directory"])
         return 0
 
     report = sideload.signed_status(args.dir)
     if args.json:
         _emit(args, report)
         return 0
-    print(f"Signed IPAs kept: {report['count']} ({_mb(report['bytes'])})")
-    print(f"  {report['directory']}")
+    print(f"  Signed IPAs kept: {_C_BOLD}{report['count']}{_C_RESET} {_C_DIM}({_mb(report['bytes'])}){_C_RESET}")
+    print(f"      {_C_DIM}{report['directory']}{_C_RESET}")
     for item in report["files"]:
-        print(f"  {item['name']}  {_mb(item['bytes'])}  {item['modified']}")
+        print(f"      {item['name']}  {_C_DIM}{_mb(item['bytes'])}  {item['modified']}{_C_RESET}")
     return 0
 
 
@@ -759,7 +1322,7 @@ def _cmd_forget(args: argparse.Namespace) -> int:
     if args.json:
         _emit(args, {"ok": removed, "bundle_id": args.bundle_id})
     else:
-        print("Removed from registry." if removed else "Not in the registry.")
+        _ok("Removed from registry") if removed else _note("Not in the registry.")
     return 0
 
 
@@ -771,38 +1334,42 @@ def _cmd_slots(args: argparse.Namespace) -> int:
         return 0
 
     team = report["team"]
-    print(f"Apple ID {report['account']}")
-    print(f"Team {team['name']} ({team['id']}) - {team['type']}")
+    print(f"  {_C_BOLD}Apple ID{_C_RESET} {_C_CYAN}{report['account']}{_C_RESET}")
+    print(f"  {_C_BOLD}Team{_C_RESET} {team['name']} {_C_DIM}({team['id']}) - {team['type']}{_C_RESET}")
 
+    certs = report["certificates"]
     print()
-    print(f"Certificates ({len(report['certificates'])}):")
-    for cert in report["certificates"]:
+    print(f"  {_C_BOLD}Certificates ({len(certs)}){_C_RESET}")
+    for cert in certs:
         # Whose it is decides whether revoking it is housekeeping or sabotage.
         if cert["in_use_here"]:
             owner = "iPASide (this machine - signing with it now)"
+            mark = _CHECK_MARK.get("ok", "")
         elif cert["ours"]:
             owner = "iPASide (another machine)"
+            mark = _CHECK_DIM
         else:
             owner = cert["machine"] or "unknown"
-        print(f"  {cert['serial']}  expires {cert['expires']}")
-        print(f"      {cert['type']}  -  {owner}")
+            mark = _CHECK_DIM
+        print(f"    {mark} {cert['serial']}  {_C_DIM}expires {cert['expires']} · {cert['type']} · {owner}{_C_RESET}")
 
     print()
     # Deliberately not printed as "N/10": the ten is a ceiling on new registrations over a
     # rolling week, and this is how many exist. Shown as one fraction it reads as spare
     # capacity that may already be spent, which is exactly how somebody gets surprised.
-    print(f"App IDs registered: {report['registered_app_ids']}")
+    print(f"  {_C_BOLD}App IDs registered: {report['registered_app_ids']}{_C_RESET}")
     for app_id in report["app_ids"]:
-        print(f"  {app_id['identifier']:<45} {app_id['name'] or ''}")
+        print(f"    {app_id['identifier']:<45} {_C_DIM}{app_id['name'] or ''}{_C_RESET}")
     print(
-        f"  (Apple also allows about {report['weekly_app_id_limit']} *new* identifiers "
-        "per 7 days, counted separately from the list above.)"
+        f"      {_C_DIM}(Apple also allows about {report['weekly_app_id_limit']} *new* "
+        "identifiers per 7 days, counted separately from the list above.)"
     )
 
     print()
-    print(f"Devices ({len(report['devices'])}):")
-    for device_entry in report["devices"]:
-        print(f"  {device_entry['udid']}  {device_entry['name'] or ''}")
+    devices_ids = report["devices"]
+    print(f"  {_C_BOLD}Devices ({len(devices_ids)}){_C_RESET}")
+    for device_entry in devices_ids:
+        print(f"    {device_entry['udid']}  {_C_DIM}{device_entry['name'] or ''}{_C_RESET}")
     return 0
 
 
@@ -811,10 +1378,10 @@ def _cmd_delete_app_id(args: argparse.Namespace) -> int:
     if args.json:
         _emit(args, result)
         return 0
-    print(f"Deleted {result['identifier'] or result['deleted']}.")
+    _ok(f"Deleted {result['identifier'] or result['deleted']}")
     # Said every time, because the obvious reading is the wrong one: the identifier is
     # free to re-use, but Apple's ~10 per week counts registrations, not what exists.
-    print(
+    _note(
         "That frees the identifier, but not one of this week's registrations - Apple "
         "counts those over a rolling seven days."
     )
@@ -827,15 +1394,15 @@ def _cmd_revoke_cert(args: argparse.Namespace) -> int:
     if args.json:
         _emit(args, result)
         return 0
-    print(f"Revoked {result['revoked']} ({result['machine'] or 'unknown machine'}).")
+    _ok(f"Revoked {result['revoked']} ({result['machine'] or 'unknown machine'})")
     if result["invalidates_local_apps"]:
-        print(
+        _note(
             "That is the certificate iPASide signs with on this machine, so the apps it "
             "installed will stop opening. Sideload or refresh one to get a new one, and "
             "LiveContainer will be handed the replacement automatically."
         )
     elif not result["was_ours"]:
-        print(
+        _note(
             "That certificate belonged to another tool, so anything it signed will stop "
             "opening until that tool issues itself a new one."
         )
@@ -850,29 +1417,29 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         if args.json:
             _emit(args, {"status": "error", "error": str(exc)})
         else:
-            print(str(exc))
+            _fail("Inspect failed", exc)
         return 1
     if args.json:
         _emit(args, report)
         return 0
-    print(f"App: {report['display_name']}  ({report['bundle_id']})")
-    print(f"  bundle: {report['app_bundle']}   executable: {report['executable']}")
+    print(f"  {_C_BOLD}{report['display_name']}{_C_RESET}  {_C_DIM}({report['bundle_id']}){_C_RESET}")
+    print(f"      bundle: {report['app_bundle']}   executable: {report['executable']}")
     print(
-        f"  version: {report['version']} (build {report['build']})   "
+        f"      version: {report['version']} (build {report['build']})   "
         f"min iOS: {report['minimum_os']}   built-with SDK: {report['platform_sdk']}"
     )
     print(
-        f"  frameworks: {len(report['frameworks'])}   "
+        f"      frameworks: {len(report['frameworks'])}   "
         f"app extensions: {len(report['extensions'])}   watch app: {report['has_watch_app']}"
     )
     print(
-        f"  embedded provision: {report['has_embedded_provision']}   "
+        f"      embedded provision: {report['has_embedded_provision']}   "
         f"FairPlay hint (SC_Info): {report['has_sc_info']}"
     )
     if report["extensions"]:
-        print("  extensions (stripped for free accounts):")
+        print(f"      {_C_DIM}extensions (stripped for free accounts):{_C_RESET}")
         for ext in report["extensions"]:
-            print(f"    - {ext}")
+            print(f"          - {ext}")
     return 0
 
 
@@ -891,19 +1458,19 @@ def _cmd_prepare(args: argparse.Namespace) -> int:
     if args.json:
         _emit(args, report)
         return 0
-    print(f"Prepared {report['app_bundle']}")
+    _ok(f"Prepared {report['app_bundle']}")
     print(f"  removed: {', '.join(report['removed']) if report['removed'] else 'nothing'}")
     print(f"  Info.plist changes: {report['info_plist_changes'] or 'none'}")
     encrypted = report["encrypted"]
     print(f"  FairPlay encrypted: {encrypted}")
     if encrypted:
-        print("  WARNING: the main binary is still encrypted; it must be decrypted")
-        print("           before signing or iOS will kill it on launch.")
+        print(f"      {_C_RED}WARNING{_C_RESET} the main binary is still encrypted; it must be decrypted")
+        print(f"      before signing or iOS will kill it on launch.")
     print(f"  remaining frameworks: {len(report['remaining_frameworks'])}")
     if report["output"]:
-        print(f"  output IPA: {report['output']}")
+        _ok(f"Output IPA {report['output']}")
     if report["workdir"]:
-        print(f"  workdir kept: {report['workdir']}")
+        _note(f"workdir kept: {report['workdir']}")
     return 0
 
 
@@ -932,9 +1499,9 @@ def _cmd_login(args: argparse.Namespace) -> int:
             _emit(args, result)
         else:
             removed = ", ".join(result.get("removed") or []) or "nothing"
-            print(f"Signed out: {removed}.")
+            _ok(f"Signed out: {removed}")
             if result.get("active"):
-                print(f"Active account is now {result['active']}.")
+                _note(f"Active account is now {result['active']}.")
         return 0
 
     if args.use:
@@ -942,7 +1509,7 @@ def _cmd_login(args: argparse.Namespace) -> int:
         if args.json:
             _emit(args, result)
         else:
-            print(f"Now using {result['email']}.")
+            _ok(f"Now using {result['email']}")
         return 0
 
     if args.accounts:
@@ -950,13 +1517,13 @@ def _cmd_login(args: argparse.Namespace) -> int:
         if args.json:
             _emit(args, state)
         elif not state["accounts"]:
-            print("No Apple IDs signed in.")
+            _note("No Apple IDs signed in.")
         else:
             for account in state["accounts"]:
-                mark = "*" if account["active"] else " "
+                mark = f"{_C_GREEN}●{_C_RESET}" if account["active"] else f"{_C_DIM}○{_C_RESET}"
                 team = account.get("team_id") or "-"
-                print(f" {mark} {account['email']:38s} team {team}")
-            print(f"{len(state['accounts'])} account(s); * is the one in use.")
+                print(f"  {mark} {account['email']:38s} {_C_DIM}team {team}{_C_RESET}")
+            print(f"\n  {_C_DIM}{len(state['accounts'])} account(s){_C_RESET}")
         return 0
 
     if args.status:
@@ -965,15 +1532,16 @@ def _cmd_login(args: argparse.Namespace) -> int:
             _emit(args, state)
         elif state["authenticated"]:
             others = state.get("account_count", 1) - 1
-            extra = f", {others} other signed in" if others > 0 else ""
-            print(f"Signed in as {state.get('email')} (adsid {state.get('adsid')}){extra}.")
+            extra = f"{_C_DIM}, {others} other signed in{_C_RESET}" if others > 0 else ""
+            print(f"  {_C_GREEN}✓{_C_RESET} signed in as {_C_BOLD}{state.get('email')}{_C_RESET} "
+                  f"{_C_DIM}(adsid {state.get('adsid')}){_C_RESET} {extra}")
         else:
-            print("Not signed in.")
+            _note("Not signed in.")
         return 0
 
     email, password = _read_credentials(args)
     if not email or not password:
-        print("error: provide --creds-file, or --email plus IPASIDE_APPLE_PASSWORD.")
+        _fail("Missing credentials", "--creds-file, or --email plus IPASIDE_APPLE_PASSWORD")
         return 2
 
     try:
@@ -985,7 +1553,7 @@ def _cmd_login(args: argparse.Namespace) -> int:
         if args.json:
             _emit(args, {"status": "error", "error": str(exc)})
         else:
-            print(f"Login failed: {exc}")
+            _fail("Login failed", exc)
         return 1
 
     if args.json:
@@ -1001,7 +1569,7 @@ def _cmd_login(args: argparse.Namespace) -> int:
             print("A verification code was sent to your trusted device(s).")
         print("Re-run the same command adding:  --code <the 6-digit code>")
     else:
-        print(f"Authenticated. adsid: {result.get('adsid')}")
+        _ok(f"Authenticated. adsid: {result.get('adsid')}")
     return 0
 
 
@@ -1021,14 +1589,14 @@ def _cmd_resolve_tweak(args: argparse.Namespace) -> int:
         if args.json:
             _emit(args, {"status": "error", "error": str(exc)})
         else:
-            print(f"error: {exc}")
+            _fail("Resolve failed", exc)
         return 1
     if args.json:
         _emit(args, {"dylibs": dylibs})
     else:
         for item in dylibs:
             arches = ",".join(item["arches"]) or "?"
-            print(f"{item['name']}  [{arches}]  {item['path']}")
+            print(f"  {_C_BOLD}{item['name']}{_C_RESET}  {_C_DIM}[{arches}]  {item['path']}{_C_RESET}")
     return 0
 
 
@@ -1174,59 +1742,67 @@ def _pairing_udid(args: argparse.Namespace) -> str:
 
 
 def _print_pairing_status(report: dict[str, Any]) -> None:
-    print(f"Pairing file for {report.get('udid') or '?'}")
+    print(f"  {_C_BOLD}Pairing file{_C_RESET} {_C_DIM}for {report.get('udid') or '?'}{_C_RESET}")
+    for line in _pairing_status_lines(report):
+        print(f"      {_C_DIM}{line}{_C_RESET}")
+    consumers = report.get("consumers") or []
+    if report.get("device_reachable") and consumers:
+        print(f"      {_C_BOLD}{len(consumers)} supported app(s){_C_RESET} {_C_DIM}installed:{_C_RESET}")
+        for consumer in consumers:
+            extra = " (needs Remote Pairing)" if consumer.get("needs_rppairing") else ""
+            print(
+                f"          {consumer.get('app_name') or consumer.get('name')}  "
+                f"{consumer.get('bundle_id')}  {consumer.get('filename')}{_C_DIM}{extra}{_C_RESET}"
+            )
+
+
+def _pairing_status_lines(report: dict[str, Any]) -> list[str]:
+    """The dim detail block under the pairing headline."""
     source = report.get("source") or "none"
     if source == "imported":
-        print(f"  Source: imported ({report.get('imported_path')})")
+        lines = [f"Source: imported ({report.get('imported_path')})"]
     elif source == "lockdown":
-        print("  Source: this PC's USB pairing record")
+        lines = ["Source: this PC's USB pairing record"]
     else:
-        print("  Source: none")
-    print(f"  USB lockdown keys: {'yes' if report.get('has_lockdown') else 'no'}")
-    print(f"  Remote Pairing keys: {'yes' if report.get('has_rppairing') else 'no'}")
+        lines = ["Source: none"]
+    lines.append(f"USB lockdown keys: {'yes' if report.get('has_lockdown') else 'no'}")
+    lines.append(f"Remote Pairing keys: {'yes' if report.get('has_rppairing') else 'no'}")
     if report.get("error"):
-        print(f"  {report['error']}")
+        lines.append(str(report["error"]))
     elif report.get("note"):
-        print(f"  {report['note']}")
-    consumers = report.get("consumers") or []
+        lines.append(str(report["note"]))
     if not report.get("device_reachable"):
         reason = report.get("device_error") or "the device could not be listed"
-        print(f"  Installed apps: not listed ({reason})")
-        return
-    if not consumers:
-        print(
-            "  No supported apps are installed. Sideload EscapeOS, SideStore, "
+        lines.append(f"Installed apps: not listed ({reason})")
+    elif not report.get("consumers"):
+        lines.append(
+            "No supported apps are installed. Sideload EscapeOS, SideStore, "
             "AltStore, LiveContainer, or StikDebug, then place the file."
         )
-        return
-    print(f"  {len(consumers)} supported app(s) installed:")
-    for consumer in consumers:
-        extra = " (needs Remote Pairing)" if consumer.get("needs_rppairing") else ""
-        print(
-            f"      {consumer.get('app_name') or consumer.get('name')}  "
-            f"{consumer.get('bundle_id')}  {consumer.get('filename')}{extra}"
-        )
+    return lines
 
 
 def _print_pairing_delivery(result: dict[str, Any]) -> None:
     placed = result.get("placed") or []
     if not placed:
-        print(
+        _note(
             "No supported apps are installed on this iPhone. Sideload EscapeOS, "
             "SideStore, AltStore, LiveContainer, or StikDebug first."
         )
         return
-    print(f"Placed pairing file on {len(placed)} app(s):")
+    print(f"  {_C_BOLD}{len(placed)} app(s){_C_RESET} {_C_DIM}got the pairing file:{_C_RESET}")
     for item in placed:
         name = item.get("name") or item.get("bundle_id")
+        mark = _CHECK_MARK.get("ok", "") if item.get("placed") else _CHECK_MARK.get("fail", "")
         if item.get("placed"):
-            print(f"  {name}: wrote {item.get('filename')} ({item.get('bytes')} bytes)")
+            body = f"{name}: wrote {item.get('filename')} ({item.get('bytes')} bytes)"
         else:
-            print(f"  {name}: failed ({item.get('error')})")
+            body = f"{name}: failed ({item.get('error')})"
+        print(f"      {mark}  {body}")
         if item.get("warning"):
-            print(f"    {item['warning']}")
+            print(f"          {_C_DIM}{item['warning']}{_C_RESET}")
     if result.get("note") and not result.get("has_rppairing"):
-        print(result["note"])
+        _note(result["note"])
 
 
 def _cmd_pairing(args: argparse.Namespace) -> int:
@@ -1237,32 +1813,32 @@ def _cmd_pairing(args: argparse.Namespace) -> int:
             _emit(args, result)
             return 0
         if result.get("created"):
-            print(f"Created Remote Pairing keys for {udid}")
+            _ok(f"Created Remote Pairing keys for {udid}")
         else:
-            print(f"Remote Pairing keys already present for {udid}")
+            _note(f"Remote Pairing keys already present for {udid}")
         if result.get("path"):
-            print(f"  Stored at {result['path']}")
+            print(f"      {_C_DIM}stored at {result['path']}{_C_RESET}")
         if result.get("note"):
-            print(f"  {result['note']}")
+            _note(result["note"])
         return 1 if result.get("error") or not result.get("has_rppairing") else 0
     if args.pairing_export:
         result = pairing.export_to(udid, args.pairing_export)
         if args.json:
             _emit(args, result)
             return 0
-        print(f"Wrote {result['bytes']} bytes to {result['path']}")
+        _ok(f"Wrote {result['bytes']} bytes → {result['path']}")
         if result.get("note"):
-            print(result["note"])
+            _note(result["note"])
         return 0
     if args.pairing_import:
         result = pairing.import_from(udid, args.pairing_import)
         if args.json:
             _emit(args, result)
             return 0
-        print(f"Imported pairing file for {udid}")
-        print(f"  Stored at {result['path']}")
+        _ok(f"Imported pairing file for {udid}")
+        print(f"      {_C_DIM}stored at {result['path']}{_C_RESET}")
         if result.get("note"):
-            print(f"  {result['note']}")
+            _note(result["note"])
         return 0
     if args.deliver or args.pairing_app:
         apps_filter = [args.pairing_app] if args.pairing_app else None
@@ -1327,7 +1903,11 @@ def dispatch(args: argparse.Namespace) -> int:
     connection = getattr(args, "connection", None)
     if connection:
         os.environ[lockdown.CONNECTION_ENV] = connection
-    return _HANDLERS[args.command](args)
+    try:
+        return _HANDLERS[args.command](args)
+    finally:
+        # Kill the pretty-progress timer even when a handler raises or exits early.
+        _PROGRESS.stop()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1366,11 +1946,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="folder for the signed .ipa + signing scratch (default: the app's signed folder)",
     )
 
-    parser = argparse.ArgumentParser(
-        prog="ipaside_engine",
+    parser = _RootParser(
+        prog="ipaside",
         description="iPASide Engine - iOS device + Apple services core.",
         parents=[common],
     )
+    parser.subcommands = [name for name in _HANDLERS if name != "serve"]
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("doctor", parents=[common], help="check the environment for sideloading readiness")
@@ -1497,7 +2078,10 @@ def build_parser() -> argparse.ArgumentParser:
         "sideload", parents=[common, target, signed_output],
         help="provision + sign + install an IPA in one step",
     )
-    sideload_parser.add_argument("ipa", help="path to the .ipa file")
+    sideload_parser.add_argument(
+        "ipa", nargs="?", default=None,
+        help="path to the .ipa file (omit to pick one interactively)",
+    )
     sideload_parser.add_argument("--bundle-id", default=None, help="override bundle id (default: the app's own)")
     sideload_parser.add_argument("--name", default=None, help="app display name (CFBundleDisplayName)")
     sideload_parser.add_argument("--set-version", default=None, help="override CFBundleShortVersionString")
@@ -1727,7 +2311,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     _force_utf8()
     _enable_fault_handler()
+    argv = list(argv) if argv is not None else sys.argv[1:]
+    # No command given: show the palette instead of argparse's error wall.
+    # (-h/--help is still a help request and falls through to the parser.)
+    if all(arg.startswith("-") and arg not in ("-h", "--help") for arg in argv):
+        return _print_menu()
     args = build_parser().parse_args(argv)
+    # --json may sit before the subcommand; argparse parents then parse it twice
+    # and the subparser's default silently resets it to False.
+    if "--json" in argv:
+        args.json = True
     try:
         return dispatch(args)
     except EngineError as exc:
