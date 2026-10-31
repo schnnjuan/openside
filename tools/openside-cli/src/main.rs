@@ -1,7 +1,8 @@
 // OpenSide TUI — ratatui front-end for the Python engine over NDJSON.
 //
-// All signing/insta logic lives in `ipaside_engine serve`; this binary only
-// renders, collects keys/mouse and streams engine frames.
+// All signing/install logic lives in `ipaside_engine serve`; this binary only
+// renders, collects keys/mouse and streams engine frames. Fully menu-driven:
+// no typing — pick a command, pick an .ipa / an app, engine does the rest.
 
 mod logo;
 
@@ -20,7 +21,7 @@ use ratatui::widgets::{Block, List, ListState, Paragraph};
 use ratatui::Terminal;
 use serde_json::{json, Value};
 
-// ---- theme (physical ratscope palette, pixel theme) ----
+// ---- palette (ratscope pixel theme) ----
 const CY: Color = Color::Rgb(41, 173, 255);
 const MAG: Color = Color::Rgb(255, 119, 168);
 const GRN: Color = Color::Rgb(0, 228, 54);
@@ -28,6 +29,7 @@ const RED: Color = Color::Rgb(255, 0, 77);
 const YEL: Color = Color::Rgb(255, 236, 39);
 const GRAY: Color = Color::Rgb(131, 118, 156);
 const BG: Color = Color::Rgb(16, 16, 26);
+const DARK: Color = Color::Rgb(10, 10, 15);
 
 /// every painted cell carries the app bg so transparent terminals stay solid
 fn st(fg: Color) -> Style {
@@ -36,6 +38,7 @@ fn st(fg: Color) -> Style {
 
 static ENGINE_VERSION: OnceLock<String> = OnceLock::new();
 
+// ---- engine process ----
 struct Engine {
     child: Child,
 }
@@ -55,19 +58,22 @@ impl Engine {
         };
         // The engine package is not installed in the venv; `python -m` needs the
         // dir that contains `ipaside_engine/` on cwd or PYTHONPATH.
-        let engine_dir = std::env::var("OPENSIDE_ENGINE_DIR").ok().filter(|d| {
-            std::path::Path::new(d).join("ipaside_engine").is_dir()
-        }).or_else(|| {
-            ["./src/iPASide.Engine", "../src/iPASide.Engine"].iter()
-                .find(|d| std::path::Path::new(d).join("ipaside_engine").is_dir())
-                .map(|d| d.to_string())
-        }).or_else(|| {
-            let home = std::env::var("HOME").ok()?;
-            ["projects/openside", "iPASide"]
-                .iter()
-                .map(|p| format!("{home}/{p}/src/iPASide.Engine"))
-                .find(|c| std::path::Path::new(c).join("ipaside_engine").is_dir())
-        });
+        let engine_dir = std::env::var("OPENSIDE_ENGINE_DIR")
+            .ok()
+            .filter(|d| std::path::Path::new(d).join("ipaside_engine").is_dir())
+            .or_else(|| {
+                ["./src/iPASide.Engine", "../src/iPASide.Engine"]
+                    .iter()
+                    .find(|d| std::path::Path::new(d).join("ipaside_engine").is_dir())
+                    .map(|d| d.to_string())
+            })
+            .or_else(|| {
+                let home = std::env::var("HOME").ok()?;
+                ["projects/openside", "iPASide"]
+                    .iter()
+                    .map(|p| format!("{home}/{p}/src/iPASide.Engine"))
+                    .find(|c| std::path::Path::new(c).join("ipaside_engine").is_dir())
+            });
         let mut cmd = Command::new(python);
         cmd.args(["-m", "ipaside_engine", "serve"])
             .stdin(Stdio::piped())
@@ -126,33 +132,69 @@ impl Drop for Engine {
     }
 }
 
-const MENU: &[&str] = &["doctor", "devices", "device-info", "installs", "signed", "version"];
+// ---- actions ----
+/// What happens when the user picks something in a dialog.
+enum Choice {
+    Sideload(String),  // ipa path
+    Uninstall(String), // bundle id
+}
+
+enum Item {
+    /// engine command, no interaction needed
+    Run(&'static str),
+    /// open the .ipa picker, then run `sideload <path>`
+    PickIpa,
+    /// fetch installs, pick an app, then run `uninstall <bundle>`
+    PickApp,
+}
+
+const MENU: &[(&str, Item)] = &[
+    ("doctor", Item::Run("doctor")),
+    ("devices", Item::Run("devices")),
+    ("device-info", Item::Run("device-info")),
+    ("installs", Item::Run("installs")),
+    ("signed .ipas", Item::Run("signed")),
+    ("anisette status", Item::Run("anisette")),
+    ("version", Item::Run("version")),
+    ("sideload an .ipa…", Item::PickIpa),
+    ("uninstall an app…", Item::PickApp),
+    ("refresh expiring", Item::Run("refresh")),
+];
+
+struct Dialog {
+    title: String,
+    items: Vec<(String, Choice)>,
+    sel: usize,
+}
 
 struct App {
     selection: usize,
-    input: String,
     log: Vec<Line<'static>>,
-    scroll: u16,
     spinner: Option<String>,
     devices: Option<Value>,
+    dialog: Option<Dialog>,
+    /// set while an `installs` fetch is in flight to feed the app picker
+    fetching: Option<Fetch>,
     next_id: u64,
-    pending: Option<u64>,
+}
+
+enum Fetch {
+    Uninstall,
 }
 
 impl App {
     fn new() -> Self {
         Self {
             selection: 0,
-            input: String::new(),
             log: vec![Line::from(Span::styled(
-                "openside — type a command, arrows pick from the menu",
+                "openside — pick with ↑↓, run with ⏎",
                 st(GRAY),
             ))],
-            scroll: 0,
             spinner: None,
             devices: None,
+            dialog: None,
+            fetching: None,
             next_id: 1,
-            pending: None,
         }
     }
 
@@ -161,25 +203,21 @@ impl App {
         if self.log.len() > 1000 {
             self.log.drain(0..self.log.len() - 1000);
         }
-        self.scroll = u16::MAX; // clamp below = stick to bottom
     }
 
     fn note(&mut self, text: impl Into<String>) {
         self.push(Line::from(Span::styled(text.into(), st(GRAY))));
     }
 
-    fn dispatch(&mut self) -> Option<Vec<String>> {
-        let args: Vec<String> = if self.input.trim().is_empty() {
-            vec![MENU[self.selection].to_string()]
-        } else {
-            self.input.trim().split_whitespace().map(str::to_string).collect()
-        };
-        self.input.clear();
+    fn run(&mut self, args: Vec<String>) {
         self.next_id += 1;
-        self.pending = Some(self.next_id);
-        Some(args)
+        let id = self.next_id;
+        self.push(Line::from(Span::styled(format!("» run {}", args.join(" ")), st(CY))));
+        STAGED.with(|s| {
+            s.borrow_mut()
+                .push((id, serde_json::to_string(&args).unwrap_or_default()))
+        });
     }
-
     fn handle_frame(&mut self, frame: Value) {
         match frame.get("type").and_then(Value::as_str) {
             Some("ready") => {
@@ -187,37 +225,32 @@ impl App {
                     let _ = ENGINE_VERSION.set(v.to_string());
                 }
                 self.note(format!(
-                "engine ready · v{}",
-                frame.get("version").cloned().unwrap_or(Value::Null)
-            ));
+                    "engine ready · v{}",
+                    frame.get("version").cloned().unwrap_or(Value::Null)
+                ));
             }
             Some("progress") => {
                 self.spinner = frame.get("line").and_then(Value::as_str).map(str::to_string);
             }
             Some("result") => {
                 self.spinner = None;
-                self.pending = None;
-                let id = frame.get("id").and_then(Value::as_u64).unwrap_or(0);
-                if let Some(got) = self.pending {
-                    if id != 0 && got != id {
-                        return; // stale answer after a reset
-                    }
-                }
-                let ok = frame
-                    .get("ok")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let (mark, mark_color) = if ok { ("✓", GRN) } else { ("✗", RED) };
-                self.push(Line::from(vec![
-                    Span::styled(mark, Style::new().fg(mark_color)),
-                    Span::raw(" "),
-                ]));
+                let ok = frame.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                let (mark, col) = if ok { ("✓", GRN) } else { ("✗", RED) };
+                self.push(Line::from(Span::styled(mark, st(col))));
                 for line in render_value(
                     frame.get("data").or_else(|| frame.get("error")).unwrap_or(&Value::Null),
-                    1,
                     if ok { Color::White } else { RED },
                 ) {
                     self.push(line);
+                }
+                // feed the app picker when that fetch was for uninstall
+                if ok && matches!(self.fetching, Some(Fetch::Uninstall)) {
+                    self.fetching = None;
+                    if let Some(dialog) = app_picker(frame.get("data").unwrap_or(&Value::Null)) {
+                        self.dialog = Some(dialog);
+                    } else {
+                        self.note("no sideloaded apps recorded");
+                    }
                 }
             }
             Some("event") => {
@@ -240,76 +273,106 @@ impl App {
     }
 }
 
-// ---- render a JSON value as colored terminal lines ----
-fn render_value(value: &Value, depth: usize, base: Color) -> Vec<Line<'static>> {
-    let pad = "  ".repeat(depth);
-    match value {
-        Value::String(s) => vec![Line::from(format!("{pad}{s}"))],
-        Value::Number(n) => vec![span_line(&pad, n, YEL).into()],
-        Value::Bool(b) => vec![span_line(&pad, b, if *b { GRN } else { MAG }).into()],
-        Value::Object(map) => map
-            .iter()
-            .flat_map(|(key, val)| match val {
-                Value::Object(_) | Value::Array(_) => {
-                    let mut lines = vec![Line::from(vec![
-                        span_line(&pad, key, CY),
-                        Span::styled(":", st(GRAY)),
-                    ])];
-                    lines.extend(render_value(val, depth + 1, base));
-                    lines
-                }
-                Value::String(s) => vec![Line::from(vec![
-                    span_line(&pad, key, CY),
-                    span_line("  ", s.clone(), base),
-                ])],
-                other => vec![Line::from(vec![
-                    span_line(&pad, key, CY),
-                    span_line("  ", other.to_string(), base),
-                ])],
-            })
-            .collect(),
-        Value::Array(items) if items.is_empty() => vec![Line::from(format!("{pad}· none"))],
-        Value::Array(items) => {
-            let scalar = items.iter().all(|v| !matches!(v, Value::Object(_)));
-            if scalar {
-                vec![Line::from(format!(
-                    "{pad}{}",
-                    items
-                        .iter()
-                        .map(|v| scalar_str(v))
-                        .collect::<Vec<_>>()
-                        .join("  ")
-                ))]
-            } else {
-                items
-                    .iter()
-                    .flat_map(|v| render_value(v, depth + 1, base))
-                    .collect()
+thread_local! {
+    /// commands queued by App, sent to the engine by the main loop
+    static STAGED: std::cell::RefCell<Vec<(u64, String)>> = std::cell::RefCell::new(vec![]);
+}
+
+/// installs JSON records (name/bundle_id/…) → uninstall picker
+fn app_picker(data: &Value) -> Option<Dialog> {
+    let mut items = Vec::new();
+    if let Some(list) = data.as_array() {
+        for record in list {
+            let bundle = record.get("bundle_id").and_then(Value::as_str);
+            if let Some(bundle) = bundle {
+                let name = record.get("name").and_then(Value::as_str).unwrap_or(bundle);
+                items.push((
+                    format!("{name} — {bundle}"),
+                    Choice::Uninstall(bundle.to_string()),
+                ));
             }
         }
-        Value::Null => vec![Line::from(Span::styled(
-            format!("{pad}· empty"),
-            st(GRAY),
+    }
+    if items.is_empty() {
+        return None;
+    }
+    Some(Dialog {
+        title: "uninstall which app?".into(),
+        items,
+        sel: 0,
+    })
+}
+
+/// scan common dirs for sideloadable .ipas (env override: OPENSIDE_IPA_DIRS)
+fn ipa_candidates() -> Vec<String> {
+    let dirs = std::env::var("OPENSIDE_IPA_DIRS").unwrap_or_else(|_| {
+        std::env::var("HOME")
+            .map(|h| format!("{h}/Downloads:{h}/Desktop:{h}/macos-vm/shared"))
+            .unwrap_or_default()
+    });
+    let mut found = Vec::new();
+    for dir in dirs.split(':').filter(|d| !d.is_empty()) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_ipa = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("ipa"))
+                == Some(true);
+            if is_ipa {
+                found.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+// ---- render a JSON value as colored terminal lines ----
+fn render_value(value: &Value, base: Color) -> Vec<Line<'static>> {
+    match value {
+        Value::String(s) => vec![Line::from(s.clone())],
+        Value::Number(n) => vec![Line::from(Span::styled(n.to_string(), st(YEL)))],
+        Value::Bool(b) => vec![Line::from(Span::styled(
+            b.to_string(),
+            st(if *b { GRN } else { MAG }),
         ))],
+        Value::Object(map) => map
+            .iter()
+            .flat_map(|(key, val)| {
+                let shown = match val {
+                    Value::String(s) => s.clone(),
+                    Value::Null => "empty".to_string(),
+                    other => {
+                        let compact = serde_json::to_string(other).unwrap_or_default();
+                        if compact.len() > 200 {
+                            format!("{}…", &compact[..200])
+                        } else {
+                            compact
+                        }
+                    }
+                };
+                vec![Line::from(vec![
+                    Span::styled(format!("  {key}"), st(CY)),
+                    Span::styled(format!("   {shown}"), st(base)),
+                ])]
+            })
+            .collect(),
+        Value::Array(items) if items.is_empty() => {
+            vec![Line::from(Span::styled("  · empty", st(GRAY)))]
+        }
+        Value::Array(items) => items.iter().flat_map(|v| render_value(v, base)).collect(),
+        Value::Null => vec![Line::from(Span::styled("  · empty", st(GRAY)))],
     }
-}
-
-fn scalar_str(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
-}
-
-fn span_line(head: &str, text: impl std::fmt::Display, color: Color) -> Span<'static> {
-    Span::styled(format!("{head}{text}"), st(color))
 }
 
 // ---- header logo, half-block rendering ----
 fn logo_lines(word: &str) -> Vec<Line<'static>> {
     let g = logo::grid(word);
     let ramp = [CY, CY, MAG, MAG, GRN, GRN];
-    let base = Style::new();
     (0..g.len().div_ceil(2))
         .map(|pair| {
             let top_row = &g[pair * 2];
@@ -325,7 +388,9 @@ fn logo_lines(word: &str) -> Vec<Line<'static>> {
                 } else {
                     spans.push(Span::styled(
                         "▀",
-                        base.fg(if *top { color } else { BG }).bg(if *bottom { color } else { BG }),
+                        Style::new()
+                            .fg(if *top { color } else { BG })
+                            .bg(if *bottom { color } else { BG }),
                     ));
                 }
             }
@@ -334,7 +399,7 @@ fn logo_lines(word: &str) -> Vec<Line<'static>> {
         .collect()
 }
 
-// ---- chrome (same grammar as ratscope: solid bg + pixel frame + inner title) ----
+// ---- chrome (ratscope grammar: solid bg + pixel frame + inner title) ----
 fn pblock(col: Color) -> Block<'static> {
     Block::bordered()
         .border_set(border::QUADRANT_OUTSIDE)
@@ -358,12 +423,26 @@ fn box_title(f: &mut ratatui::Frame, area: Rect, title: &str, col: Color) -> Rec
     chunks[1]
 }
 
-fn real_scroll(len: usize, height: u16, wanted: u16) -> u16 {
+/// max while following the tail; otherwise frozen offset clamped in range
+fn real_scroll(len: usize, height: u16, stored: u16, bottom: bool) -> u16 {
     let max = len.saturating_sub(height as usize) as u16;
-    if wanted >= u16::MAX - 1 { max } else { wanted.min(max) }
+    if bottom {
+        max
+    } else {
+        stored.min(max)
+    }
 }
 
-// ---- draw ----
+fn connected(devices: &Option<Value>) -> usize {
+    devices
+        .as_ref()
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0)
+}
+
+const FOOT: &str = " ↑↓ pick · ⏎ run · esc quit ";
+
 fn main() -> io::Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let (mut engine, rx) = match Engine::spawn() {
@@ -374,6 +453,8 @@ fn main() -> io::Result<()> {
         }
     };
     let mut app = App::new();
+    let mut log_bottom = true; // stick to the tail until the user scrolls
+    let mut log_stored: u16 = 0;
     crossterm::terminal::enable_raw_mode()?;
     crossterm::execute!(
         io::stdout(),
@@ -386,27 +467,34 @@ fn main() -> io::Result<()> {
         while let Ok(frame) = rx.try_recv() {
             app.handle_frame(frame);
         }
-        let mut list = ListState::default();
-        list.select(Some(app.selection));
+        // flush queued runs to the engine
+        let queued: Vec<(u64, String)> = STAGED.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        for (id, args_json) in queued {
+            let args: Vec<String> =
+                serde_json::from_str(&args_json).expect("staged args roundtrip");
+            engine.send(id, &args)?;
+        }
 
         terminal.draw(|f| {
             let area = f.area();
             f.render_widget(Block::default().style(Style::new().bg(BG)), area);
 
             let rows = Layout::vertical([
-                Constraint::Length(LOGO_HEIGHT as u16 + 1),
+                Constraint::Length(logo::SLOT_ROWS as u16 / 2 + 1),
                 Constraint::Min(0),
-                Constraint::Length(1),
                 Constraint::Length(1),
             ])
             .split(area);
-            let header = Layout::horizontal([Constraint::Length(LOGO_COLS + 2), Constraint::Min(0)])
+            let header = Layout::horizontal([Constraint::Length(57), Constraint::Min(0)])
                 .split(rows[0]);
             f.render_widget(Paragraph::new(logo_lines("openside")), header[0]);
             f.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled("version ", st(GRAY)),
-                    Span::styled(ENGINE_VERSION.get().map(|s| s.as_str()).unwrap_or("…"), st(GRAY)),
+                    Span::styled("engine ", st(GRAY)),
+                    Span::styled(
+                        ENGINE_VERSION.get().map(String::as_str).unwrap_or("…"),
+                        st(GRAY),
+                    ),
                 ]))
                 .alignment(ratatui::layout::Alignment::Right)
                 .style(Style::new().bg(BG)),
@@ -415,15 +503,13 @@ fn main() -> io::Result<()> {
 
             let body = Layout::horizontal([Constraint::Length(32), Constraint::Min(0)])
                 .split(rows[1]);
-
-            // menu
             let menu_inner = box_title(f, body[0], "engine", CY);
             let mut list = ListState::default();
             list.select(Some(app.selection));
             f.render_stateful_widget(
                 List::new(
                     MENU.iter()
-                        .map(|m| m.to_string())
+                        .map(|(name, _)| name.to_string())
                         .collect::<Vec<String>>(),
                 )
                 .highlight_symbol("» ")
@@ -432,10 +518,9 @@ fn main() -> io::Result<()> {
                 &mut list,
             );
 
-            // output
             let log_inner = box_title(f, body[1], "output", MAG);
-            let vis = log_inner.height;
-            let scroll = real_scroll(app.log.len(), vis.saturating_sub(1), app.scroll);
+            let vis = log_inner.height.saturating_sub(1);
+            let scroll = real_scroll(app.log.len(), vis, log_stored, log_bottom);
             f.render_widget(
                 Paragraph::new(app.log.clone())
                     .style(Style::new().bg(BG))
@@ -443,66 +528,127 @@ fn main() -> io::Result<()> {
                 log_inner,
             );
 
-            // input bar (solid darker chrome) with caret via terminal cursor
-            f.render_widget(Block::default().style(Style::new().bg(Color::Rgb(10, 10, 15))), rows[2]);
+            // footer
             f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(" > ", st(CY).add_modifier(Modifier::BOLD)),
-                    Span::styled(app.input.clone(), st(Color::White)),
-                ]))
-                .style(Style::new().bg(Color::Rgb(10, 10, 15))),
+                Block::default().style(Style::new().bg(DARK)),
                 rows[2],
             );
-
-            // footer: hints left, status right
-            f.render_widget(Block::default().style(Style::new().bg(Color::Rgb(10, 10, 15))), rows[3]);
-            let status_text = match (&app.spinner, app.pending) {
-                (Some(line), _) => format!("{line}…"),
-                (None, Some(id)) => format!("waiting {id}…"),
-                _ => format!("ready · {} connected", connected(&app.devices)),
-            };
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(FOOT, st(GRAY))))
-                    .style(Style::new().bg(Color::Rgb(10, 10, 15))),
-                rows[3],
+                    .style(Style::new().bg(DARK)),
+                rows[2],
             );
-            let status_col = area.width.saturating_sub(status_text.len() as u16 + 2);
+            let status_text = match (&app.spinner, &app.fetching) {
+                (Some(line), _) => format!("{line}… "),
+                (_, Some(_)) => "fetching app list… ".to_string(),
+                _ => format!("ready · {} connected", connected(&app.devices)),
+            };
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     status_text,
                     if app.spinner.is_some() { st(YEL) } else { st(GRN) },
                 )))
-                .style(Style::new().bg(Color::Rgb(10, 10, 15)))
+                .style(Style::new().bg(DARK))
                 .alignment(ratatui::layout::Alignment::Right),
-                rows[3],
+                rows[2],
             );
-            let _ = status_col;
 
-            // terminal caret sits inside the input bar
-            f.set_cursor_position(ratatui::layout::Position::new(rows[2].x + 3 + app.input.len() as u16, rows[2].y));
+            // dialog overlay (last = on top)
+            if let Some(dlog) = &app.dialog {
+                let width = (57.min(area.width.saturating_sub(4))).max(20);
+                let height = (dlog.items.len() as u16 + 5).min(rows[1].height.saturating_sub(2));
+                let x = area.x + (area.width.saturating_sub(width)) / 2;
+                let y = rows[1].y + (rows[1].height.saturating_sub(height)) / 2;
+                let inner = box_title(f, Rect { x, y, width, height }, &dlog.title, YEL);
+                let mut dsel = ListState::default();
+                dsel.select(Some(dlog.sel));
+                f.render_stateful_widget(
+                    List::new(
+                        dlog.items
+                            .iter()
+                            .map(|(label, _)| label.clone())
+                            .collect::<Vec<String>>(),
+                    )
+                    .highlight_symbol("» ")
+                    .highlight_style(st(Color::White).add_modifier(Modifier::BOLD)),
+                    inner,
+                    &mut dsel,
+                );
+            }
         })?;
 
         if !crossterm::event::poll(Duration::from_millis(50))? {
             continue;
         }
-        match crossterm::event::read()? {
-            crossterm::event::Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
+        let ev = crossterm::event::read()?;
+        // dialog consumes navigation first
+        if let Some(dialog) = app.dialog.as_mut() {
+            if let crossterm::event::Event::Key(key) = &ev {
+                if key.kind == crossterm::event::KeyEventKind::Press {
+                    match key.code {
+                        crossterm::event::KeyCode::Up => dialog.sel = dialog.sel.saturating_sub(1),
+                        crossterm::event::KeyCode::Down => {
+                            dialog.sel = (dialog.sel + 1).min(dialog.items.len() - 1)
+                        }
+                        crossterm::event::KeyCode::PageUp => dialog.sel = dialog.sel.saturating_sub(10),
+                        crossterm::event::KeyCode::PageDown => {
+                            dialog.sel = (dialog.sel + 10).min(dialog.items.len() - 1)
+                        }
+                        crossterm::event::KeyCode::Esc => app.dialog = None,
+                        crossterm::event::KeyCode::Enter => {
+                            let (_, choice) = dialog.items.remove(dialog.sel);
+                            app.dialog = None;
+                            match choice {
+                                Choice::Sideload(path) => app.run(vec!["sideload".into(), path]),
+                                Choice::Uninstall(bundle) => {
+                                    app.run(vec!["uninstall".into(), bundle])
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+            }
+            continue;
+        }
+        match ev {
+            crossterm::event::Event::Key(key)
+                if key.kind == crossterm::event::KeyEventKind::Press =>
+            {
                 match key.code {
                     crossterm::event::KeyCode::Up => app.selection = app.selection.saturating_sub(1),
                     crossterm::event::KeyCode::Down => {
                         app.selection = (app.selection + 1).min(MENU.len() - 1)
                     }
-                    crossterm::event::KeyCode::PageUp => app.scroll = app.scroll.saturating_sub(5),
-                    crossterm::event::KeyCode::PageDown => app.scroll = app.scroll.saturating_add(5),
+                    crossterm::event::KeyCode::Home => app.selection = 0,
+                    crossterm::event::KeyCode::End => app.selection = MENU.len() - 1,
                     crossterm::event::KeyCode::Enter => {
-                        if let Some(args) = app.dispatch() {
-                            let id = app.pending.unwrap_or(0);
-                            engine.send(id, &args)?;
-                            app.note(format!("> {}", args.join(" ")));
+                        match &MENU[app.selection].1 {
+                            Item::Run(cmd) => app.run(vec![(*cmd).to_string()]),
+                            Item::PickIpa => {
+                                let found = ipa_candidates();
+                                if found.is_empty() {
+                                    app.note("no .ipa in OPENSIDE_IPA_DIRS (default Downloads/Desktop/macos-vm/shared)");
+                                } else {
+                                    app.dialog = Some(Dialog {
+                                        title: "sideload which .ipa?".into(),
+                                        items: found
+                                            .into_iter()
+                                            .map(|p| {
+                                                let label = p.rsplit('/').next().unwrap_or(&p).to_string();
+                                                (label, Choice::Sideload(p))
+                                            })
+                                            .collect(),
+                                        sel: 0,
+                                    });
+                                }
+                            }
+                            Item::PickApp => {
+                                app.fetching = Some(Fetch::Uninstall);
+                                app.run(vec!["installs".into()]);
+                            }
                         }
-                    }
-                    crossterm::event::KeyCode::Backspace => {
-                        app.input.pop();
                     }
                     crossterm::event::KeyCode::Esc => break,
                     crossterm::event::KeyCode::Char('c')
@@ -510,18 +656,15 @@ fn main() -> io::Result<()> {
                     {
                         break
                     }
-                    crossterm::event::KeyCode::Char(c) => app.input.push(c),
                     _ => {}
                 }
             }
             crossterm::event::Event::Mouse(mouse) => match mouse.kind {
-                crossterm::event::MouseEventKind::Down(_) => {}
                 crossterm::event::MouseEventKind::ScrollUp => {
-                    app.scroll = app.scroll.saturating_sub(3)
+                    log_bottom = false;
+                    log_stored = log_stored.saturating_sub(2);
                 }
-                crossterm::event::MouseEventKind::ScrollDown => {
-                    app.scroll = app.scroll.saturating_add(3)
-                }
+                crossterm::event::MouseEventKind::ScrollDown => log_bottom = true,
                 _ => {}
             },
             _ => {}
@@ -538,25 +681,38 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn connected(devices: &Option<Value>) -> usize {
-    devices.as_ref().and_then(Value::as_array).map(|a| a.len()).unwrap_or(0)
-}
-
-const LOGO_HEIGHT: usize = 6;
-const LOGO_COLS: u16 = 55;
-const FOOT: &str = " ↑↓ menu · ⏎ run · ⇞⇟ scroll · esc quit ";
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
 
     #[test]
-    fn logo_gives_4_rows_and_ink() {
+    fn logo_gives_pairs_and_ink() {
         let lines = logo_lines("openside");
-        assert_eq!(lines.len(), logo::grid("openside").len() / 2);
+        assert_eq!(
+            lines.len(),
+            logo::grid("openside").len().div_ceil(2),
+            "logo desenha pares de pixels"
+        );
         let styled = lines.iter().flat_map(|l| l.spans.clone()).count();
         assert!(styled > 50, "logo precisa ter ▀ desenhado");
     }
 
+    #[test]
+    fn app_picker_from_installs_json() {
+        let data: Value = serde_json::from_str(
+            r#"[{"name":"WhatsApp","bundle_id":"net.whatsapp.WhatsApp","expired":false,"days_left":5},
+                {"name":"X","bundle_id":"x.app"}]"#,
+        )
+        .unwrap();
+        let dialog = app_picker(&data).unwrap();
+        assert_eq!(dialog.items.len(), 2);
+        assert!(matches!(dialog.items[1].1, Choice::Uninstall(ref b) if b == "x.app"));
+        assert!(dialog.title.contains("uninstall"));
+    }
+
+    #[test]
+    fn app_picker_empty() {
+        assert!(app_picker(&json!([])).is_none());
+        assert!(app_picker(&json!(null)).is_none());
+    }
 }
