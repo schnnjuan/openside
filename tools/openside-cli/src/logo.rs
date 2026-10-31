@@ -1,20 +1,47 @@
-// Pixel glyphs in the same hand-drawn family as the "ratscope" wordmark.
-// 6px wide, variable height, rendered with half-blocks so one terminal
-// row = two pixels.
+// Pixel glyphs, hand-drawn, same family as the "ratscope" wordmark.
+// 6px wide. Shared baseline: slot 12 rows tall — x-height letters ink rows
+// 2-9, ascender/dot up to row 0, descender down to row 11. Rendered with
+// half-blocks: one terminal row = two pixel rows.
+
+pub const SLOT_ROWS: usize = 12;
 
 pub const GLYPHS: &[(&str, &[&str])] = &[
-    ("i", &[".####.", "..##..", "..##..", "..##..", "..##..", "..##..", ".####."]),
-    ("p", &["#####.", "##..##", "##..##", "##..##", "#####.", "##....", "##....", "##...."]),
-    ("o", &[".####.", "##..##", "##..##", "##..##", "##..##", "##..##", "##..##", ".####."]),
-    ("n", &["#####.", "##..##", "##..##", "##..##", "##..##", "##..##", "##..##", "##..##"]),
-    ("s", &[".#####", "##....", "##....", ".####.", "....##", "....##", "....##", "#####."]),
-    ("d", &[".####.", "##..##", "##..##", "##..##", "##..##", "##..##", "##..##", ".####."]),
-    ("e", &[".####.", "##..##", "##..##", "######", "##....", "##....", "##..##", ".####."]),
-    ("a", &[".####.", "....##", "....##", ".####.", "##..##", "##..##", "##..##", ".####."]),
+    ("i", &[
+        "..##..", "..##..", "......", "..##..", "..##..", "..##..",
+        "..##..", "..##..", "..##..", "..##..", "......", "......",
+    ]),
+    ("o", &[
+        "......", "......", ".####.", "##..##", "##..##", "##..##",
+        "##..##", "##..##", "##..##", ".####.", "......", "......",
+    ]),
+    ("p", &[
+        "......", "......", ".####.", "##..##", "##..##", "##..##",
+        ".####.", "##....", "##....", "##....", "##....", "##....",
+    ]),
+    ("n", &[
+        "......", "......", "#####.", "##..##", "##..##", "##..##",
+        "##..##", "##..##", "##..##", "##..##", "......", "......",
+    ]),
+    ("s", &[
+        "......", "......", ".#####", "##....", "##....", ".####.",
+        "....##", "....##", "....##", "#####.", "......", "......",
+    ]),
+    ("d", &[
+        "....##", "....##", ".####.", "##..##", "##..##", "##..##",
+        "##..##", "##..##", "##..##", ".####.", "......", "......",
+    ]),
+    ("e", &[
+        "......", "......", ".####.", "##..##", "##..##", "######",
+        "##....", "##....", "##..##", ".####.", "......", "......",
+    ]),
+    ("a", &[
+        "......", "......", ".####.", "....##", "....##", ".####.",
+        "##..##", "##..##", "##..##", ".####.", "......", "......",
+    ]),
 ];
 
-/// Logical pixel grid for a word: rows of ' '/'#'. Width gaining 1px gutters
-/// between letters, height = tallest glyph.
+/// Logical pixel grid for a word: rows of ' '/'#', SLOT_ROWS tall,
+/// 1px gutter between letters.
 pub fn grid(word: &str) -> Vec<Vec<bool>> {
     let glyphs: Vec<&[&str]> = word
         .chars()
@@ -28,9 +55,8 @@ pub fn grid(word: &str) -> Vec<Vec<bool>> {
     if glyphs.is_empty() {
         return vec![];
     }
-    let height = glyphs.iter().map(|g| g.len()).max().unwrap();
     let width = glyphs.len() * 6 + (glyphs.len() - 1);
-    let mut rows = vec![vec![false; width]; height];
+    let mut rows = vec![vec![false; width]; SLOT_ROWS];
     let mut x = 0usize;
     for glyph in glyphs {
         for (y, row) in glyph.iter().enumerate() {
@@ -50,9 +76,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn baseline_shared() {
+        let g = grid("openside");
+        // bottom ink row = baseline: some ink in slot row 9, none in 11's pair mismatch
+        assert!(g[9].iter().any(|&b| b), "baseline na linha 9");
+        assert!(g.iter().take(2).all(|row| !row.iter().all(|&b| b) || row.iter().any(|&b| b)));
+    }
+
+    #[test]
     fn grid_has_full_strokes() {
         let g = grid("openside");
-        assert_eq!(g.len(), 8);
+        assert_eq!(g.len(), SLOT_ROWS);
         assert!(g.iter().all(|row| row.len() == 8 * 6 + 7));
         // every letter leaves ink
         assert!(g.iter().any(|row| row.iter().any(|&b| b)));

@@ -28,6 +28,11 @@ const YEL: Color = Color::Rgb(255, 236, 39);
 const GRAY: Color = Color::Rgb(131, 118, 156);
 const BG: Color = Color::Rgb(16, 16, 26);
 
+/// every painted cell carries the app bg so transparent terminals stay solid
+fn st(fg: Color) -> Style {
+    Style::new().fg(fg).bg(BG)
+}
+
 struct Engine {
     child: Child,
 }
@@ -45,14 +50,40 @@ impl Engine {
                 }
             }
         };
-        let mut child = Command::new(python)
-            .args(["-m", "ipaside_engine", "serve"])
+        // The engine package is not installed in the venv; `python -m` needs the
+        // dir that contains `ipaside_engine/` on cwd or PYTHONPATH.
+        let engine_dir = std::env::var("OPENSIDE_ENGINE_DIR").ok().filter(|d| {
+            std::path::Path::new(d).join("ipaside_engine").is_dir()
+        }).or_else(|| {
+            ["./src/iPASide.Engine", "../src/iPASide.Engine"].iter()
+                .find(|d| std::path::Path::new(d).join("ipaside_engine").is_dir())
+                .map(|d| d.to_string())
+        }).or_else(|| {
+            let home = std::env::var("HOME").ok()?;
+            ["projects/openside", "iPASide"]
+                .iter()
+                .map(|p| format!("{home}/{p}/src/iPASide.Engine"))
+                .find(|c| std::path::Path::new(c).join("ipaside_engine").is_dir())
+        });
+        let mut cmd = Command::new(python);
+        cmd.args(["-m", "ipaside_engine", "serve"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        if let Some(dir) = &engine_dir {
+            cmd.current_dir(dir).env("PYTHONPATH", dir);
+        }
+        let mut child = cmd.spawn()?;
 
         let stdout = child.stdout.take().expect("engine stdout");
+        let stderr = child.stderr.take().expect("engine stderr");
         let (tx, rx) = mpsc::channel();
+        let err_tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().flatten() {
+                let _ = err_tx.send(json!({"type": "stderr", "line": line}));
+            }
+        });
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 match line {
@@ -112,7 +143,7 @@ impl App {
             input: String::new(),
             log: vec![Line::from(Span::styled(
                 "openside — type a command, arrows pick from the menu",
-                Style::new().fg(GRAY),
+                st(GRAY),
             ))],
             scroll: 0,
             spinner: None,
@@ -131,7 +162,7 @@ impl App {
     }
 
     fn note(&mut self, text: impl Into<String>) {
-        self.push(Line::from(Span::styled(text.into(), Style::new().fg(GRAY))));
+        self.push(Line::from(Span::styled(text.into(), st(GRAY))));
     }
 
     fn dispatch(&mut self) -> Option<Vec<String>> {
@@ -189,6 +220,10 @@ impl App {
                     self.push(Line::from(format!("devices changed — {count} connected")));
                 }
             }
+            Some("stderr") => {
+                let line = frame.get("line").and_then(Value::as_str).unwrap_or("");
+                self.push(Line::from(Span::styled(line.to_string(), st(RED))));
+            }
             _ => {
                 let text = serde_json::to_string(&frame).unwrap_or_default();
                 self.note(format!("frame {text}"));
@@ -210,7 +245,7 @@ fn render_value(value: &Value, depth: usize, base: Color) -> Vec<Line<'static>> 
                 Value::Object(_) | Value::Array(_) => {
                     let mut lines = vec![Line::from(vec![
                         span_line(&pad, key, CY),
-                        Span::styled(":", Style::new().fg(GRAY)),
+                        Span::styled(":", st(GRAY)),
                     ])];
                     lines.extend(render_value(val, depth + 1, base));
                     lines
@@ -246,7 +281,7 @@ fn render_value(value: &Value, depth: usize, base: Color) -> Vec<Line<'static>> 
         }
         Value::Null => vec![Line::from(Span::styled(
             format!("{pad}· empty"),
-            Style::new().fg(GRAY),
+            st(GRAY),
         ))],
     }
 }
@@ -259,7 +294,7 @@ fn scalar_str(v: &Value) -> String {
 }
 
 fn span_line(head: &str, text: impl std::fmt::Display, color: Color) -> Span<'static> {
-    Span::styled(format!("{head}{text}"), Style::new().fg(color))
+    Span::styled(format!("{head}{text}"), st(color))
 }
 
 // ---- header logo, half-block rendering ----
@@ -328,6 +363,8 @@ fn main() -> io::Result<()> {
             .split(area);
 
             // header: logo + menu side by side
+            f.render_widget(Block::default().style(Style::new().bg(BG)), area);
+
             let header = Layout::horizontal([Constraint::Length(60), Constraint::Min(0)])
                 .split(chunks[0]);
             let logo = logo_lines("openside");
@@ -342,11 +379,11 @@ fn main() -> io::Result<()> {
                         Block::default()
                             .borders(Borders::ALL)
                             .border_set(border::ROUNDED)
-                            .border_style(Style::new().fg(GRAY))
-                            .title(Span::styled("menu", Style::new().fg(CY))),
+                            .border_style(st(GRAY))
+                            .title(Span::styled("menu", st(CY))),
                     )
                     .highlight_symbol(FIELD_ARROW)
-                    .highlight_style(Style::new().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    .highlight_style(st(Color::White).add_modifier(Modifier::BOLD)),
                 body[0],
                 &mut list,
             );
@@ -355,28 +392,32 @@ fn main() -> io::Result<()> {
                 0,
                 app.log.iter().len().saturating_sub(1).min(u16::MAX as usize) as u16,
             );
-            f.render_widget(Paragraph::new(app.log.clone()).scroll((scroll, 0)), log_area);
+            f.render_widget(
+                Paragraph::new(app.log.clone()).style(Style::new().bg(BG)).scroll((scroll, 0)),
+                log_area,
+            );
 
             // input
             let input_spans = vec![
-                Span::styled("> ", Style::new().fg(CY)),
+                Span::styled("> ", st(CY)),
                 Span::raw(app.input.clone()),
             ];
             f.render_widget(
                 Paragraph::new(Line::from(input_spans)).style(Style::new().bg(BG)),
                 chunks[2],
             );
+            f.render_widget(Block::default().style(Style::new().bg(Color::Rgb(10, 10, 15))), chunks[3]);
 
             // status
             let status = match (&app.spinner, app.pending) {
-                (Some(line), _) => Line::from(Span::styled(format!("{line}…"), Style::new().fg(YEL))),
+                (Some(line), _) => Line::from(Span::styled(format!("{line}…"), st(YEL))),
                 (None, Some(id)) => Line::from(Span::styled(
                     format!("waiting for {id}…"),
-                    Style::new().fg(GRAY),
+                    st(GRAY),
                 )),
                 _ => Line::from(Span::styled(
                     format!("ready · {} connected", connected(&app.devices)),
-                    Style::new().fg(GRAY),
+                    st(GRAY),
                 )),
             };
             f.render_widget(Paragraph::new(status), chunks[3]);
@@ -442,7 +483,7 @@ fn connected(devices: &Option<Value>) -> usize {
     devices.as_ref().and_then(Value::as_array).map(|a| a.len()).unwrap_or(0)
 }
 
-const LOGO_HEIGHT: usize = 4;
+const LOGO_HEIGHT: usize = 6;
 const FIELD_ARROW: &str = "» ";
 
 #[cfg(test)]
