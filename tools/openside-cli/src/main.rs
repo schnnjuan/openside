@@ -742,88 +742,51 @@ fn installs_view(data: &Value) -> Vec<Line<'static>> {
 const BOT_PNG: &[u8] = include_bytes!("assets/openside.png");
 const BOT_ROWS: u16 = 12;
 
-/// carrega a arte, recorta ao conteúdo e pinta a margem com o fundo do app
+/// carrega a arte: compõe o alpha sobre o fundo do app (o halfblocks
+/// compõe alpha como preto) e faz o resize Nearest no grid exato de células
+/// — o encoder do halfblocks sempre re-resiza com Triangle, então a imagem
+/// precisa já chegar no tamanho final pra virar no-op
 fn bot_protocol() -> Option<Bot> {
-    let decoded = image::ImageReader::new(std::io::Cursor::new(BOT_PNG))
-        .with_guessed_format()
-        .ok()?
-        .decode()
-        .ok()?
-        .into_rgba8();
-    let (w, h) = (decoded.width() as usize, decoded.height() as usize);
-    let px = decoded.into_raw();
+    let img = image::load_from_memory(BOT_PNG).ok()?.into_rgba8();
 
-    let lum = |x: usize, y: usize| -> u32 {
-        let i = (y * w + x) * 4;
-        (u32::from(px[i]) + u32::from(px[i + 1]) + u32::from(px[i + 2])) / 3
-    };
-    let dark = |x: usize, y: usize| lum(x, y) < 215;
-    let empty_col = |x: usize| (0..h).all(|y| !dark(x, y));
-    let empty_row = |y: usize| (0..w).all(|x| !dark(x, y));
-    let x0 = (0..w).take_while(|&x| empty_col(x)).count();
-    let x1 = w - (0..w).rev().take_while(|&x| empty_col(x)).count();
-    let y0 = (0..h).take_while(|&y| empty_row(y)).count();
-    let y1 = h - (0..h).rev().take_while(|&y| empty_row(y)).count();
-    let cw = x1.saturating_sub(x0).max(1);
-    let ch = y1.saturating_sub(y0).max(1);
+    // bbox do conteúdo por alpha
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let x0 = (0..w).take_while(|&x| (0..h).all(|y| img.get_pixel(x as u32, y as u32).0[3] <= 10)).count();
+    let x1 = w - (0..w).rev().take_while(|&x| (0..h).all(|y| img.get_pixel(x as u32, y as u32).0[3] <= 10)).count();
+    let y0 = (0..h).take_while(|&y| (0..w).all(|x| img.get_pixel(x as u32, y as u32).0[3] <= 10)).count();
+    let y1 = h - (0..h).rev().take_while(|&y| (0..w).all(|x| img.get_pixel(x as u32, y as u32).0[3] <= 10)).count();
+    let cropped = image::imageops::crop_imm(
+        &img,
+        x0 as u32,
+        y0 as u32,
+        (x1.saturating_sub(x0)).max(1) as u32,
+        (y1.saturating_sub(y0)).max(1) as u32,
+    )
+    .to_image();
 
-    let mut cropped = Vec::with_capacity(cw * ch * 4);
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let i = (y * w + x) * 4;
-            cropped.extend_from_slice(&px[i..i + 4]);
-        }
-    }
+    let mut canvas = image::RgbaImage::from_pixel(
+        cropped.width(),
+        cropped.height(),
+        image::Rgba([0x01, 0x2D, 0x2D, 255]),
+    );
+    image::imageops::overlay(&mut canvas, &cropped, 0, 0);
 
-    // margem branco-neve conetada à borda vira o fundo do app
-    fn near_white(px: &[u8], seen: &[bool], c: usize) -> bool {
-        !seen[c] && px[c * 4] > 215 && px[c * 4 + 1] > 215 && px[c * 4 + 2] > 215
-    }
-    let bg = [0x01, 0x2D, 0x2D, 255];
-    let mut flood = std::collections::VecDeque::new();
-    let mut seen = vec![false; cw * ch];
-    for x in 0..cw {
-        let c = x;
-        if near_white(&cropped, &seen, c) { seen[c] = true; flood.push_back((x, 0)); }
-        let c2 = (ch - 1) * cw + x;
-        if near_white(&cropped, &seen, c2) { seen[c2] = true; flood.push_back((x, ch - 1)); }
-    }
-    for y in 0..ch {
-        let c = y * cw;
-        if near_white(&cropped, &seen, c) { seen[c] = true; flood.push_back((0, y)); }
-        let c2 = y * cw + cw - 1;
-        if near_white(&cropped, &seen, c2) { seen[c2] = true; flood.push_back((cw - 1, y)); }
-    }
-    while let Some((x, y)) = flood.pop_front() {
-        let c = y * cw + x;
-        cropped[c * 4..c * 4 + 4].copy_from_slice(&bg);
-        for (nx, ny) in [
-            (x.saturating_sub(1), y),
-            ((x + 1).min(cw - 1), y),
-            (x, y.saturating_sub(1)),
-            (x, (y + 1).min(ch - 1)),
-        ] {
-            let nc = ny * cw + nx;
-            if near_white(&cropped, &seen, nc) {
-                seen[nc] = true;
-                flood.push_back((nx, ny));
-            }
-        }
-    }
-
-    let dyn_img =
-        image::DynamicImage::ImageRgba8(image::RgbaImage::from_raw(cw as u32, ch as u32, cropped)?);
-    // from_query_stdio reads stdin waiting for terminal replies — it eats
-    // keys in ptys without a responder; halfblocks is the safe default
-    // (crispness comes from the Nearest filter below)
     let picker = ratatui_image::picker::Picker::halfblocks();
     let fs = picker.font_size();
-    let cols = ((BOT_ROWS as f32 * fs.height as f32 * cw as f32)
-        / (fs.width as f32 * ch as f32))
+    let cols = ((BOT_ROWS as f32 * fs.height as f32 * canvas.width() as f32)
+        / (fs.width as f32 * canvas.height() as f32))
         .ceil() as u16;
+
+    let target = image::imageops::resize(
+        &canvas,
+        u32::from(cols) * u32::from(fs.width),
+        u32::from(BOT_ROWS) * u32::from(fs.height),
+        image::imageops::FilterType::Nearest,
+    );
+
     picker
         .new_protocol(
-            dyn_img,
+            image::DynamicImage::ImageRgba8(target),
             ratatui::layout::Size::new(cols, BOT_ROWS),
             ratatui_image::Resize::Fit(None),
         )
