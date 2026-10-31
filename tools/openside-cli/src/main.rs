@@ -1049,24 +1049,11 @@ fn main() -> io::Result<()> {
             ])
             .split(rows[0]);
             f.render_widget(Paragraph::new(logo_lines("openside")), header[1]);
-            let tagrow = Layout::horizontal([
-                Constraint::Length(1),
-                Constraint::Min(0),
-                Constraint::Length(2),
-            ])
-            .split(rows[0]);
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "  fix-it style sideloader · v0.1.0",
-                    st(GRAY),
-                )))
-                .style(Style::new().bg(BG)),
-                tagrow[1],
-            );
             let n_devices = connected(&app.devices);
             let busy = app.spinner.is_some() || app.app_action.is_some();
             f.render_widget(
                 Paragraph::new(Line::from(vec![
+                    Span::styled("fix-it style sideloader · v0.1.0  ", st(GRAY)),
                     Span::styled(" anx set ", Style::new().fg(DARK).bg(GRAY)),
                     Span::raw(" "),
                     Span::styled(format!(" engine {} ", ENGINE_VERSION.get().map(String::as_str).unwrap_or("…")), Style::new().fg(BG).bg(CY)),
@@ -1079,7 +1066,7 @@ fn main() -> io::Result<()> {
                 ]))
                 .alignment(ratatui::layout::Alignment::Right)
                 .style(Style::new().bg(BG)),
-                header[1],
+                header[2],
             );
 
             let body = Layout::horizontal([Constraint::Length(32), Constraint::Min(0)])
