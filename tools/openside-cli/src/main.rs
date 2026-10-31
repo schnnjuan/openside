@@ -22,14 +22,16 @@ use ratatui::Terminal;
 use serde_json::{json, Value};
 
 // ---- palette (ratscope pixel theme) ----
-const CY: Color = Color::Rgb(41, 173, 255);
-const MAG: Color = Color::Rgb(255, 119, 168);
-const GRN: Color = Color::Rgb(0, 228, 54);
-const RED: Color = Color::Rgb(255, 0, 77);
-const YEL: Color = Color::Rgb(255, 236, 39);
-const GRAY: Color = Color::Rgb(131, 118, 156);
-const BG: Color = Color::Rgb(16, 16, 26);
-const DARK: Color = Color::Rgb(10, 10, 15);
+// Maki palette — from the reference art: night-blue bg, dark green hair,
+// violet glasses, warm skin. Roles unchanged (info/success/warn/destroy).
+const CY: Color = Color::Rgb(96, 148, 224);
+const MAG: Color = Color::Rgb(178, 118, 240);
+const GRN: Color = Color::Rgb(94, 158, 96);
+const RED: Color = Color::Rgb(214, 74, 92);
+const YEL: Color = Color::Rgb(242, 198, 138);
+const GRAY: Color = Color::Rgb(112, 118, 142);
+const BG: Color = Color::Rgb(14, 17, 32);
+const DARK: Color = Color::Rgb(9, 12, 24);
 
 /// every painted cell carries the app bg so transparent terminals stay solid
 fn st(fg: Color) -> Style {
@@ -730,6 +732,63 @@ fn installs_view(data: &Value) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// portrait palette: hair dark green / lighter green / skin / glasses /
+/// eyes / teeth / uniform — '.' is transparent (renders as bg)
+const HAIR: Color = Color::Rgb(56, 112, 66);
+const HAIR_HI: Color = Color::Rgb(88, 156, 92);
+const SKIN: Color = Color::Rgb(240, 196, 140);
+const VIOLET: Color = Color::Rgb(178, 118, 240);
+const INK: Color = Color::Rgb(24, 26, 34);
+const TEETH: Color = Color::Rgb(238, 238, 240);
+const UNIFORM: Color = Color::Rgb(72, 64, 104);
+
+/// maki head bot, hand-drawn 12 rows x 9 cols, rendered as half-blocks
+fn maki_lines() -> Vec<Line<'static>> {
+    let map: [&str; 12] = [
+        "...hhhh..",
+        "..hhhhhh.",
+        ".hhhhhhhh",
+        ".hhhhhhhh",
+        ".hhhhhhhh",
+        "hgssgssgh",
+        "hgesgesgh",
+        "hssswsssh",
+        ".hsssssh.",
+        "..usssu..",
+        ".uuuuuuu.",
+        "uuuuuuuuu",
+    ];
+    let tint = |c: char| match c {
+        'h' => HAIR,
+        'H' => HAIR_HI,
+        's' => SKIN,
+        'g' => VIOLET,
+        'e' => INK,
+        'w' => TEETH,
+        'u' => UNIFORM,
+        _ => BG,
+    };
+    (0..map.len().div_ceil(2))
+        .map(|pair| {
+            let top = map[pair * 2];
+            let empty = ".".repeat(map[0].len());
+            let bot = map.get(pair * 2 + 1).copied().unwrap_or(empty.as_str());
+            let mut spans = Vec::with_capacity(top.len());
+            for (t, b) in top.chars().zip(bot.chars()) {
+                if t == '.' && b == '.' {
+                    spans.push(Span::styled(" ", st(BG)));
+                } else {
+                    spans.push(Span::styled(
+                        "▀",
+                        Style::new().fg(tint(t)).bg(if b == '.' { BG } else { tint(b) }),
+                    ));
+                }
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
 // ---- header logo, half-block rendering ----
 fn logo_lines(word: &str) -> Vec<Line<'static>> {
     let g = logo::grid(word);
@@ -1008,9 +1067,15 @@ fn main() -> io::Result<()> {
                 Constraint::Length(1),
             ])
             .split(area);
-            let header = Layout::horizontal([Constraint::Length(57), Constraint::Min(0)])
-                .split(rows[0]);
-            f.render_widget(Paragraph::new(logo_lines("openside")), header[0]);
+            let header = Layout::horizontal([
+                Constraint::Length(1),
+                Constraint::Length(9),
+                Constraint::Length(57),
+                Constraint::Min(0),
+            ])
+            .split(rows[0]);
+            f.render_widget(Paragraph::new(maki_lines()), header[1]);
+            f.render_widget(Paragraph::new(logo_lines("openside")), header[2]);
             let n_devices = connected(&app.devices);
             let busy = app.spinner.is_some() || app.app_action.is_some();
             f.render_widget(
@@ -1315,6 +1380,15 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maki_grid_dims_and_halfblock_rows() {
+        let lines = maki_lines();
+        assert_eq!(lines.len(), 6); // 12 pixel rows → 6 terminal rows
+        for line in &lines {
+            assert_eq!(line.spans.len(), 9);
+        }
+    }
 
     #[test]
     fn logo_gives_pairs_and_ink() {
