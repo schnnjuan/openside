@@ -24,14 +24,17 @@ use serde_json::{json, Value};
 // ---- palette (ratscope pixel theme) ----
 // Maki palette — from the reference art: night-blue bg, dark green hair,
 // violet glasses, warm skin. Roles unchanged (info/success/warn/destroy).
-const CY: Color = Color::Rgb(86, 146, 240);
-const MAG: Color = Color::Rgb(196, 120, 255);
-const GRN: Color = Color::Rgb(80, 200, 110);
-const RED: Color = Color::Rgb(240, 84, 106);
-const YEL: Color = Color::Rgb(248, 200, 120);
-const GRAY: Color = Color::Rgb(122, 132, 160);
-const BG: Color = Color::Rgb(12, 15, 34);
-const DARK: Color = Color::Rgb(8, 10, 24);
+// Palette extracted from the character art (user-supplied hexes):
+// greens drive everything, purple is the accent, gold = warning,
+// warm shadow = destructive; bg/outline come from the darkest greens.
+const CY: Color = Color::Rgb(0x24, 0xA0, 0x67); // verde reflexo médio
+const MAG: Color = Color::Rgb(0xAA, 0x4E, 0xCB); // roxo reflexo
+const GRN: Color = Color::Rgb(0x64, 0xE0, 0xA4); // verde reflexo claro
+const RED: Color = Color::Rgb(0xAE, 0x55, 0x44); // contorno quente
+const YEL: Color = Color::Rgb(0xBE, 0x9D, 0x7A); // ouro da íris
+const GRAY: Color = Color::Rgb(0x5D, 0x8A, 0x77); // verde dim derivado
+const BG: Color = Color::Rgb(0x01, 0x2D, 0x2D); // contorno verde-escuro
+const DARK: Color = Color::Rgb(0x01, 0x1D, 0x1D);
 
 /// every painted cell carries the app bg so transparent terminals stay solid
 fn st(fg: Color) -> Style {
@@ -1366,7 +1369,7 @@ mod tests {
             Color::Rgb(r, g, b) => (r, g, b),
             _ => (0, 0, 0),
         };
-        assert!(r > 150 && r < 210 && b > 200, "meio tende ao violeta: {mid:?}");
+        assert!(r > 130 && r < 200 && b > 170, "meio tende ao violeta: {mid:?}");
     }
 
     #[test]
