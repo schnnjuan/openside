@@ -8,14 +8,15 @@ mod logo;
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListState, Paragraph};
+use ratatui::widgets::{Block, List, ListState, Paragraph};
 use ratatui::Terminal;
 use serde_json::{json, Value};
 
@@ -32,6 +33,8 @@ const BG: Color = Color::Rgb(16, 16, 26);
 fn st(fg: Color) -> Style {
     Style::new().fg(fg).bg(BG)
 }
+
+static ENGINE_VERSION: OnceLock<String> = OnceLock::new();
 
 struct Engine {
     child: Child,
@@ -179,10 +182,15 @@ impl App {
 
     fn handle_frame(&mut self, frame: Value) {
         match frame.get("type").and_then(Value::as_str) {
-            Some("ready") => self.note(format!(
+            Some("ready") => {
+                if let Some(v) = frame.get("version").and_then(Value::as_str) {
+                    let _ = ENGINE_VERSION.set(v.to_string());
+                }
+                self.note(format!(
                 "engine ready · v{}",
                 frame.get("version").cloned().unwrap_or(Value::Null)
-            )),
+            ));
+            }
             Some("progress") => {
                 self.spinner = frame.get("line").and_then(Value::as_str).map(str::to_string);
             }
@@ -326,6 +334,35 @@ fn logo_lines(word: &str) -> Vec<Line<'static>> {
         .collect()
 }
 
+// ---- chrome (same grammar as ratscope: solid bg + pixel frame + inner title) ----
+fn pblock(col: Color) -> Block<'static> {
+    Block::bordered()
+        .border_set(border::QUADRANT_OUTSIDE)
+        .border_style(st(col))
+        .style(Style::new().bg(BG))
+}
+
+fn box_title(f: &mut ratatui::Frame, area: Rect, title: &str, col: Color) -> Rect {
+    let b = pblock(col);
+    f.render_widget(&b, area);
+    let inner = b.inner(area);
+    let chunks: [Rect; 2] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" ■ {title}"),
+            st(col).add_modifier(Modifier::BOLD),
+        ))),
+        chunks[0],
+    );
+    chunks[1]
+}
+
+fn real_scroll(len: usize, height: u16, wanted: u16) -> u16 {
+    let max = len.saturating_sub(height as usize) as u16;
+    if wanted >= u16::MAX - 1 { max } else { wanted.min(max) }
+}
+
 // ---- draw ----
 fn main() -> io::Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -354,73 +391,95 @@ fn main() -> io::Result<()> {
 
         terminal.draw(|f| {
             let area = f.area();
-            let chunks = Layout::vertical([
-                Constraint::Length(LOGO_HEIGHT as u16),
+            f.render_widget(Block::default().style(Style::new().bg(BG)), area);
+
+            let rows = Layout::vertical([
+                Constraint::Length(LOGO_HEIGHT as u16 + 1),
                 Constraint::Min(0),
                 Constraint::Length(1),
                 Constraint::Length(1),
             ])
             .split(area);
+            let header = Layout::horizontal([Constraint::Length(LOGO_COLS + 2), Constraint::Min(0)])
+                .split(rows[0]);
+            f.render_widget(Paragraph::new(logo_lines("openside")), header[0]);
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("version ", st(GRAY)),
+                    Span::styled(ENGINE_VERSION.get().map(|s| s.as_str()).unwrap_or("…"), st(GRAY)),
+                ]))
+                .alignment(ratatui::layout::Alignment::Right)
+                .style(Style::new().bg(BG)),
+                header[1],
+            );
 
-            // header: logo + menu side by side
-            f.render_widget(Block::default().style(Style::new().bg(BG)), area);
+            let body = Layout::horizontal([Constraint::Length(32), Constraint::Min(0)])
+                .split(rows[1]);
 
-            let header = Layout::horizontal([Constraint::Length(60), Constraint::Min(0)])
-                .split(chunks[0]);
-            let logo = logo_lines("openside");
-            f.render_widget(Paragraph::new(logo), header[0]);
-
-            // menu + log
-            let body = Layout::horizontal([Constraint::Length(28), Constraint::Min(0)])
-                .split(chunks[1]);
+            // menu
+            let menu_inner = box_title(f, body[0], "engine", CY);
+            let mut list = ListState::default();
+            list.select(Some(app.selection));
             f.render_stateful_widget(
-                List::new(MENU.iter().map(|m| m.to_string()))
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_set(border::ROUNDED)
-                            .border_style(st(GRAY))
-                            .title(Span::styled("menu", st(CY))),
-                    )
-                    .highlight_symbol(FIELD_ARROW)
-                    .highlight_style(st(Color::White).add_modifier(Modifier::BOLD)),
-                body[0],
+                List::new(
+                    MENU.iter()
+                        .map(|m| m.to_string())
+                        .collect::<Vec<String>>(),
+                )
+                .highlight_symbol("» ")
+                .highlight_style(st(Color::White).add_modifier(Modifier::BOLD)),
+                menu_inner,
                 &mut list,
             );
-            let log_area = body[1];
-            let scroll = app.scroll.clamp(
-                0,
-                app.log.iter().len().saturating_sub(1).min(u16::MAX as usize) as u16,
-            );
+
+            // output
+            let log_inner = box_title(f, body[1], "output", MAG);
+            let vis = log_inner.height;
+            let scroll = real_scroll(app.log.len(), vis.saturating_sub(1), app.scroll);
             f.render_widget(
-                Paragraph::new(app.log.clone()).style(Style::new().bg(BG)).scroll((scroll, 0)),
-                log_area,
+                Paragraph::new(app.log.clone())
+                    .style(Style::new().bg(BG))
+                    .scroll((scroll, 0)),
+                log_inner,
             );
 
-            // input
-            let input_spans = vec![
-                Span::styled("> ", st(CY)),
-                Span::raw(app.input.clone()),
-            ];
+            // input bar (solid darker chrome) with caret via terminal cursor
+            f.render_widget(Block::default().style(Style::new().bg(Color::Rgb(10, 10, 15))), rows[2]);
             f.render_widget(
-                Paragraph::new(Line::from(input_spans)).style(Style::new().bg(BG)),
-                chunks[2],
+                Paragraph::new(Line::from(vec![
+                    Span::styled(" > ", st(CY).add_modifier(Modifier::BOLD)),
+                    Span::styled(app.input.clone(), st(Color::White)),
+                ]))
+                .style(Style::new().bg(Color::Rgb(10, 10, 15))),
+                rows[2],
             );
-            f.render_widget(Block::default().style(Style::new().bg(Color::Rgb(10, 10, 15))), chunks[3]);
 
-            // status
-            let status = match (&app.spinner, app.pending) {
-                (Some(line), _) => Line::from(Span::styled(format!("{line}…"), st(YEL))),
-                (None, Some(id)) => Line::from(Span::styled(
-                    format!("waiting for {id}…"),
-                    st(GRAY),
-                )),
-                _ => Line::from(Span::styled(
-                    format!("ready · {} connected", connected(&app.devices)),
-                    st(GRAY),
-                )),
+            // footer: hints left, status right
+            f.render_widget(Block::default().style(Style::new().bg(Color::Rgb(10, 10, 15))), rows[3]);
+            let status_text = match (&app.spinner, app.pending) {
+                (Some(line), _) => format!("{line}…"),
+                (None, Some(id)) => format!("waiting {id}…"),
+                _ => format!("ready · {} connected", connected(&app.devices)),
             };
-            f.render_widget(Paragraph::new(status), chunks[3]);
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(FOOT, st(GRAY))))
+                    .style(Style::new().bg(Color::Rgb(10, 10, 15))),
+                rows[3],
+            );
+            let status_col = area.width.saturating_sub(status_text.len() as u16 + 2);
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    status_text,
+                    if app.spinner.is_some() { st(YEL) } else { st(GRN) },
+                )))
+                .style(Style::new().bg(Color::Rgb(10, 10, 15)))
+                .alignment(ratatui::layout::Alignment::Right),
+                rows[3],
+            );
+            let _ = status_col;
+
+            // terminal caret sits inside the input bar
+            f.set_cursor_position(ratatui::layout::Position::new(rows[2].x + 3 + app.input.len() as u16, rows[2].y));
         })?;
 
         if !crossterm::event::poll(Duration::from_millis(50))? {
@@ -484,7 +543,8 @@ fn connected(devices: &Option<Value>) -> usize {
 }
 
 const LOGO_HEIGHT: usize = 6;
-const FIELD_ARROW: &str = "» ";
+const LOGO_COLS: u16 = 55;
+const FOOT: &str = " ↑↓ menu · ⏎ run · ⇞⇟ scroll · esc quit ";
 
 #[cfg(test)]
 mod tests {
