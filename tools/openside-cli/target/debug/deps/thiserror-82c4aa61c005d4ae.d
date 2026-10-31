@@ -1,0 +1,14 @@
+/home/schnnjuan/projects/openside/tools/openside-cli/target/debug/deps/thiserror-82c4aa61c005d4ae.d: /home/schnnjuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/lib.rs /home/schnnjuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/aserror.rs /home/schnnjuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/display.rs /home/schnnjuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/var.rs /home/schnnjuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/private.rs /home/schnnjuan/projects/openside/tools/openside-cli/target/debug/build/thiserror-039761fe06b35445/out/private.rs
+
+/home/schnnjuan/projects/openside/tools/openside-cli/target/debug/deps/libthiserror-82c4aa61c005d4ae.rlib: /home/schnnjuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/lib.rs /home/schnnjuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/aserror.rs /home/schnnjuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/display.rs /home/schnnjuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/var.rs /home/schnnjuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/private.rs /home/schnnjuan/projects/openside/tools/openside-cli/target/debug/build/thiserror-039761fe06b35445/out/private.rs
+
+/home/schnnjuan/projects/openside/tools/openside-cli/target/debug/deps/libthiserror-82c4aa61c005d4ae.rmeta: /home/schnnjuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/lib.rs /home/schnnjuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/aserror.rs /home/schnnjuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/display.rs /home/schnnjuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/var.rs /home/schnnjuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/private.rs /home/schnnjuan/projects/openside/tools/openside-cli/target/debug/build/thiserror-039761fe06b35445/out/private.rs
+
+/home/schnnjuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/lib.rs:
+/home/schnnjuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/aserror.rs:
+/home/schnnjuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/display.rs:
+/home/schnnjuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/var.rs:
+/home/schnnjuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/private.rs:
+/home/schnnjuan/projects/openside/tools/openside-cli/target/debug/build/thiserror-039761fe06b35445/out/private.rs:
+
+# env-dep:OUT_DIR=/home/schnnjuan/projects/openside/tools/openside-cli/target/debug/build/thiserror-039761fe06b35445/out

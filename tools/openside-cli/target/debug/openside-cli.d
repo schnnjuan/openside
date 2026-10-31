@@ -1,0 +1,1 @@
+/home/schnnjuan/projects/openside/tools/openside-cli/target/debug/openside-cli: /home/schnnjuan/projects/openside/tools/openside-cli/src/logo.rs /home/schnnjuan/projects/openside/tools/openside-cli/src/main.rs
