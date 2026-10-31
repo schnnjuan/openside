@@ -735,6 +735,85 @@ fn installs_view(data: &Value) -> Vec<Line<'static>> {
         .collect()
 }
 
+// ---- bot: retrato pixelart gerado da arte do usuario (janela/paleta dela) ----
+const BOT_MAP: [&str; 24] = [
+        "kkkkkkkkkkBkkkkkkkkkkk",
+        "kkkkkkkkDBBBBkkkkkkkkk",
+        "kkkkkkkkBDBFBBkkkkkkkk",
+        "kkkkkkkkkBFBBkkkkkkkkk",
+        "kkkkkkDBBBBBAFkkkkkkkk",
+        "kkkkkBDBABBBFFDkkkkkkk",
+        "kkkkDDBBBBBBBFBFFkkkkk",
+        "kkkBDBABBBBBBDBABkkkkk",
+        "kkCkBDBFDBFBAEkAFkkkkk",
+        "kkBAABDFBBAAFBBBFFkkkk",
+        "kkkFBFBFBAAFABkBFFkkkk",
+        "kDDFBFFFABFFSSSAFFBFDk",
+        "kCBFXFBFFBSSSMMVvkkkkk",
+        "kkFAFFSFSkSSSVVMMVvkkk",
+        "kFSwIVwSSSSVwIVSkVvkkk",
+        "kkFSVIwSSVVIVIVSWkFkkk",
+        "kkFSwSSVVWIVSIVVSkkkkk",
+        "kkkSMwSSSVVWVVwSVkkkkk",
+        "kkkkSSwXwWMKwwSVkkkkkk",
+        "kkkkkSwWWXwWwWSFkkkkkk",
+        "kkkkkkWSSWWVWSFFkkkkkk",
+        "kkkkkkkWSVWVSkkkkkkkkk",
+        "kkkkkkkkXRkWWkkkkkkkkk",
+        "kkkkkkkkkkkkkkkkkkkkkk",
+];
+
+const BOT_PAL: [(char, Color); 14] = [
+    ('A', Color::Rgb(0x02, 0x6D, 0x4F)), // verde principal
+    ('B', Color::Rgb(0x02, 0x61, 0x48)), // verde escuro
+    ('C', Color::Rgb(0x04, 0x47, 0x38)), // sombras
+    ('D', Color::Rgb(0x64, 0xE0, 0xA4)), // reflexo claro
+    ('E', Color::Rgb(0x24, 0xA0, 0x67)), // reflexo medio
+    ('F', Color::Rgb(0x01, 0x2D, 0x2D)), // contorno verde
+    ('S', Color::Rgb(0xFD, 0xD8, 0xBC)), // pele base
+    ('X', Color::Rgb(0xAE, 0x55, 0x44)), // pele sombra profunda
+    ('V', Color::Rgb(0x84, 0x2A, 0xA9)), // rocco oculos
+    ('v', Color::Rgb(0xAA, 0x4E, 0xCB)), // oculos reflexo
+    ('I', Color::Rgb(0xBE, 0x9D, 0x7A)), // ouro da ris
+    ('M', Color::Rgb(0x34, 0x22, 0x21)), // marrom escuro
+    ('w', Color::Rgb(0xFF, 0xFF, 0xFF)), // branco
+    ('k', Color::Rgb(0x00, 0x00, 0x00)), // contorno preto
+];
+
+fn bot_tint(c: char) -> Color {
+    BOT_PAL
+        .iter()
+        .find(|(ch, _)| *ch == c)
+        .map(|(_, col)| *col)
+        .unwrap_or(BG)
+}
+
+/// 24 px de altura → 12 linhas de terminal (meios-blocos)
+fn bot_lines() -> Vec<Line<'static>> {
+    let width = BOT_MAP[0].len();
+    let empty = ".".repeat(width);
+    (0..BOT_MAP.len().div_ceil(2))
+        .map(|pair| {
+            let top = BOT_MAP[pair * 2];
+            let bot = BOT_MAP.get(pair * 2 + 1).copied().unwrap_or(empty.as_str());
+            let mut spans = Vec::with_capacity(width);
+            for (t, b) in top.chars().zip(bot.chars()) {
+                if t == '.' && b == '.' {
+                    spans.push(Span::styled(" ", st(BG)));
+                } else {
+                    spans.push(Span::styled(
+                        "▀",
+                        Style::new()
+                            .fg(bot_tint(t))
+                            .bg(if b == '.' { BG } else { bot_tint(b) }),
+                    ));
+                }
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
 // ---- header logo, half-block rendering ----
 /// line-by-line gradient: rgb lerp between stops over the 12 pixel rows
 fn mix(a: Color, b: Color, t: f32) -> Color {
@@ -1039,21 +1118,27 @@ fn main() -> io::Result<()> {
             f.render_widget(Block::default().style(Style::new().bg(BG)), area);
 
             let rows = Layout::vertical([
-                Constraint::Length(logo::SLOT_ROWS as u16 / 2 + 1),
+                Constraint::Length(12),
                 Constraint::Length(1),
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
             .split(area);
             let header = Layout::horizontal([
-                Constraint::Length(1),
+                Constraint::Length(BOT_MAP[0].len() as u16),
+                Constraint::Length(2),
                 Constraint::Length(57),
                 Constraint::Min(0),
             ])
             .split(rows[0]);
-            f.render_widget(Paragraph::new(logo_lines("openside")), header[1]);
+            f.render_widget(Paragraph::new(bot_lines()), header[0]);
+            let logo_band: [Rect; 3] =
+                Layout::vertical([Constraint::Length(3), Constraint::Length(6), Constraint::Min(1)])
+                    .areas(header[2]);
+            f.render_widget(Paragraph::new(logo_lines("openside")), logo_band[1]);
+            let chips_band: [Rect; 2] =
+                Layout::vertical([Constraint::Length(6), Constraint::Length(1)]).areas(header[3]);
             let n_devices = connected(&app.devices);
-            let busy = app.spinner.is_some() || app.app_action.is_some();
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled("fix-it style sideloader · v0.1.0  ", st(GRAY)),
@@ -1065,11 +1150,10 @@ fn main() -> io::Result<()> {
                         format!(" {dot} {n_devices} device{plural} ", dot = if n_devices > 0 { "●" } else { "○" }, plural = if n_devices == 1 { "" } else { "s" }),
                         Style::new().fg(BG).bg(if n_devices > 0 { GRN } else { GRAY }),
                     ),
-                    if busy { Span::raw(" ".to_string()) } else { Span::raw(" ".to_string()) },
                 ]))
                 .alignment(ratatui::layout::Alignment::Right)
                 .style(Style::new().bg(BG)),
-                header[2],
+                chips_band[1],
             );
 
             let body = Layout::horizontal([Constraint::Length(32), Constraint::Min(0)])
@@ -1357,6 +1441,15 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bot_grid_is_rect_and_six_rows() {
+        let lines = bot_lines();
+        assert_eq!(lines.len(), 12); // 24 px → 12 terminal rows
+        for line in &lines {
+            assert_eq!(line.spans.len(), BOT_MAP[0].len());
+        }
+    }
 
     #[test]
     fn logo_gradient_line_by_line() {
