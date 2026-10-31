@@ -775,15 +775,9 @@ fn bot_protocol() -> Option<Bot> {
         / (fs.width as f32 * canvas.height() as f32))
         .ceil() as u16;
 
-    // nearest no grid exato de células (encoder vira no-op…)…
-    let mut target = image::imageops::resize(
-        &canvas,
-        u32::from(cols) * fs_w,
-        u32::from(BOT_ROWS) * fs_h,
-        image::imageops::FilterType::Nearest,
-    );
-    // …eé quantiza aos 19 tons da paleta: o anti-aliasing amostrado pelo
-    // nearest vira pixels sujos — volta a cor do bloco mais próximo
+    // downscale por voto majoritário (o que fez o mapa manual ficar bom):
+    // contorno/anti-aliasing ficam em minoria na célula, o bloco sólido vence —
+    // point-sampling de nearest pega o contorno fora de proporção e escurece tudo
     const PAL: [[u8; 3]; 19] = [
         [0x02, 0x6D, 0x4F], [0x02, 0x61, 0x48], [0x04, 0x47, 0x38], [0x64, 0xE0, 0xA4],
         [0x24, 0xA0, 0x67], [0x01, 0x2D, 0x2D], [0xFD, 0xD8, 0xBC], [0xED, 0xB8, 0x9C],
@@ -791,17 +785,39 @@ fn bot_protocol() -> Option<Bot> {
         [0xAA, 0x4E, 0xCB], [0x62, 0x17, 0x81], [0xBD, 0xB4, 0xDA], [0xBE, 0x9D, 0x7A],
         [0x34, 0x22, 0x21], [0xFF, 0xFF, 0xFF], [0x00, 0x00, 0x00],
     ];
-    for pxzi in target.pixels_mut() {
+    let (tw, th) = (u32::from(cols) * fs_w, u32::from(BOT_ROWS) * fs_h);
+    let (sw, sh) = (canvas.width() as usize, canvas.height() as usize);
+    let mut votes = vec![0u32; (tw as usize) * (th as usize) * PAL.len()];
+    let stride = (((sw as u32 / tw) / 3).max(1), ((sh as u32 / th) / 3).max(1));
+    for (sx, sy, pxzi) in canvas.enumerate_pixels() {
         let (r, g, b) = (pxzi.0[0], pxzi.0[1], pxzi.0[2]);
+        if sx % stride.0 != 0 || sy % stride.1 != 0 {
+            continue;
+        }
+        // rótulo mais próximo da paleta
         let (py, pg, pb) = (i32::from(r), i32::from(g), i32::from(b));
-        let (mut br, mut bg2, mut bb, mut bd) = (0, 0, 0, i32::MAX);
-        for &[pr, pq, pbk] in &PAL {
+        let mut label = 0usize;
+        let mut bd = i32::MAX;
+        for (idx, &[pr, pq, pbk]) in PAL.iter().enumerate() {
             let d = (py - i32::from(pr)).pow(2) + (pg - i32::from(pq)).pow(2) + (pb - i32::from(pbk)).pow(2);
             if d < bd {
-                (br, bg2, bb, bd) = (pr, pq, pbk, d);
+                bd = d;
+                label = idx;
             }
         }
-        *pxzi = image::Rgba([br, bg2, bb, 255]);
+        let tx = (sx * tw / sw as u32).min(tw - 1);
+        let ty = (sy * th / sh as u32).min(th - 1);
+        votes[((ty * tw + tx) as usize) * PAL.len() + label] += 1;
+    }
+    let mut target = image::RgbaImage::new(tw, th);
+    for (i, pxzi) in target.pixels_mut().enumerate() {
+        let bin = votes[i * PAL.len()..(i + 1) * PAL.len()]
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, &v)| v)
+            .map_or(0, |(ii, _)| ii);
+        let c = PAL[bin];
+        *pxzi = image::Rgba([c[0], c[1], c[2], 255]);
     }
 
     picker
