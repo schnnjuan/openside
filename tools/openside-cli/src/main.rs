@@ -148,6 +148,20 @@ enum Item {
     PickApp,
 }
 
+/// aligned with MENU — one-line description shown under the list
+const MENU_DESC: &[&str] = &[
+    "engine self-check",
+    "connected iPhones",
+    "selected device details",
+    "sideloaded apps + expiry",
+    "cached signed .ipas",
+    "anisette provisioning status",
+    "engine build",
+    "sign + install an .ipa",
+    "remove a sideloaded app",
+    "re-sign apps expiring soon",
+];
+
 const MENU: &[(&str, Item)] = &[
     ("doctor", Item::Run("doctor")),
     ("devices", Item::Run("devices")),
@@ -441,7 +455,47 @@ fn connected(devices: &Option<Value>) -> usize {
         .unwrap_or(0)
 }
 
-const FOOT: &str = " ↑↓ pick · ⏎ run · esc quit ";
+const FOOT: &str = " ↑↓/click pick · click again or ⏎ run · esc quit ";
+
+/// run the currently selected menu entry (key ⏎ or second click)
+fn activate_menu(app: &mut App) {
+    match &MENU[app.selection].1 {
+        Item::Run(cmd) => app.run(vec![(*cmd).to_string()]),
+        Item::PickIpa => {
+            let found = ipa_candidates();
+            if found.is_empty() {
+                app.note("no .ipa in OPENSIDE_IPA_DIRS (default Downloads/Desktop/macos-vm/shared)");
+            } else {
+                app.dialog = Some(Dialog {
+                    title: "sideload which .ipa?".into(),
+                    items: found
+                        .into_iter()
+                        .map(|p| {
+                            let label = p.rsplit('/').next().unwrap_or(&p).to_string();
+                            (label, Choice::Sideload(p))
+                        })
+                        .collect(),
+                    sel: 0,
+                });
+            }
+        }
+        Item::PickApp => {
+            app.fetching = Some(Fetch::Uninstall);
+            app.run(vec!["installs".into()]);
+        }
+    }
+}
+
+/// apply the chosen dialog item and close it
+fn confirm_dialog(app: &mut App) {
+    if let Some(mut dialog) = app.dialog.take() {
+        let (_, choice) = dialog.items.remove(dialog.sel);
+        match choice {
+            Choice::Sideload(path) => app.run(vec!["sideload".into(), path]),
+            Choice::Uninstall(bundle) => app.run(vec!["uninstall".into(), bundle]),
+        }
+    }
+}
 
 fn main() -> io::Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -455,6 +509,7 @@ fn main() -> io::Result<()> {
     let mut app = App::new();
     let mut log_bottom = true; // stick to the tail until the user scrolls
     let mut log_stored: u16 = 0;
+    let mut last_click: Option<(u16, u16)> = None;
     crossterm::terminal::enable_raw_mode()?;
     crossterm::execute!(
         io::stdout(),
@@ -475,6 +530,8 @@ fn main() -> io::Result<()> {
             engine.send(id, &args)?;
         }
 
+        let mut hit_menu_list = Rect::default();
+        let mut hit_dialog_list = Rect::default();
         terminal.draw(|f| {
             let area = f.area();
             f.render_widget(Block::default().style(Style::new().bg(BG)), area);
@@ -488,13 +545,19 @@ fn main() -> io::Result<()> {
             let header = Layout::horizontal([Constraint::Length(57), Constraint::Min(0)])
                 .split(rows[0]);
             f.render_widget(Paragraph::new(logo_lines("openside")), header[0]);
+            let n_devices = connected(&app.devices);
+            let busy = app.spinner.is_some() || app.fetching.is_some();
             f.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled("engine ", st(GRAY)),
+                    Span::styled(" anx set ", Style::new().fg(DARK).bg(GRAY)),
+                    Span::raw(" "),
+                    Span::styled(format!(" engine {} ", ENGINE_VERSION.get().map(String::as_str).unwrap_or("…")), Style::new().fg(BG).bg(CY)),
+                    Span::raw(" "),
                     Span::styled(
-                        ENGINE_VERSION.get().map(String::as_str).unwrap_or("…"),
-                        st(GRAY),
+                        format!(" {dot} {n_devices} device{plural} ", dot = if n_devices > 0 { "●" } else { "○" }, plural = if n_devices == 1 { "" } else { "s" }),
+                        Style::new().fg(BG).bg(if n_devices > 0 { GRN } else { GRAY }),
                     ),
+                    if busy { Span::raw(" ".to_string()) } else { Span::raw(" ".to_string()) },
                 ]))
                 .alignment(ratatui::layout::Alignment::Right)
                 .style(Style::new().bg(BG)),
@@ -503,22 +566,34 @@ fn main() -> io::Result<()> {
 
             let body = Layout::horizontal([Constraint::Length(32), Constraint::Min(0)])
                 .split(rows[1]);
-            let menu_inner = box_title(f, body[0], "engine", CY);
+            let menu_cols: [Rect; 2] =
+                Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(
+                    box_title(f, body[0], "commands", CY),
+                );
+            hit_menu_list = menu_cols[0];
             let mut list = ListState::default();
             list.select(Some(app.selection));
             f.render_stateful_widget(
                 List::new(
                     MENU.iter()
-                        .map(|(name, _)| name.to_string())
+                        .map(|(name, _)| format!("▪ {name}"))
                         .collect::<Vec<String>>(),
                 )
                 .highlight_symbol("» ")
                 .highlight_style(st(Color::White).add_modifier(Modifier::BOLD)),
-                menu_inner,
+                menu_cols[0],
                 &mut list,
             );
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(" {} ", MENU_DESC[app.selection]),
+                    st(GRAY).add_modifier(Modifier::DIM),
+                )))
+                .style(Style::new().bg(BG)),
+                menu_cols[1],
+            );
 
-            let log_inner = box_title(f, body[1], "output", MAG);
+            let log_inner = box_title(f, body[1], &format!("output — {} lines", app.log.len()), MAG);
             let vis = log_inner.height.saturating_sub(1);
             let scroll = real_scroll(app.log.len(), vis, log_stored, log_bottom);
             f.render_widget(
@@ -560,6 +635,7 @@ fn main() -> io::Result<()> {
                 let x = area.x + (area.width.saturating_sub(width)) / 2;
                 let y = rows[1].y + (rows[1].height.saturating_sub(height)) / 2;
                 let inner = box_title(f, Rect { x, y, width, height }, &dlog.title, YEL);
+                hit_dialog_list = inner;
                 let mut dsel = ListState::default();
                 dsel.select(Some(dlog.sel));
                 f.render_stateful_widget(
@@ -595,16 +671,7 @@ fn main() -> io::Result<()> {
                             dialog.sel = (dialog.sel + 10).min(dialog.items.len() - 1)
                         }
                         crossterm::event::KeyCode::Esc => app.dialog = None,
-                        crossterm::event::KeyCode::Enter => {
-                            let (_, choice) = dialog.items.remove(dialog.sel);
-                            app.dialog = None;
-                            match choice {
-                                Choice::Sideload(path) => app.run(vec!["sideload".into(), path]),
-                                Choice::Uninstall(bundle) => {
-                                    app.run(vec!["uninstall".into(), bundle])
-                                }
-                            }
-                        }
+                        crossterm::event::KeyCode::Enter => confirm_dialog(&mut app),
                         _ => {}
                     }
                     continue;
@@ -623,32 +690,12 @@ fn main() -> io::Result<()> {
                     }
                     crossterm::event::KeyCode::Home => app.selection = 0,
                     crossterm::event::KeyCode::End => app.selection = MENU.len() - 1,
-                    crossterm::event::KeyCode::Enter => {
-                        match &MENU[app.selection].1 {
-                            Item::Run(cmd) => app.run(vec![(*cmd).to_string()]),
-                            Item::PickIpa => {
-                                let found = ipa_candidates();
-                                if found.is_empty() {
-                                    app.note("no .ipa in OPENSIDE_IPA_DIRS (default Downloads/Desktop/macos-vm/shared)");
-                                } else {
-                                    app.dialog = Some(Dialog {
-                                        title: "sideload which .ipa?".into(),
-                                        items: found
-                                            .into_iter()
-                                            .map(|p| {
-                                                let label = p.rsplit('/').next().unwrap_or(&p).to_string();
-                                                (label, Choice::Sideload(p))
-                                            })
-                                            .collect(),
-                                        sel: 0,
-                                    });
-                                }
-                            }
-                            Item::PickApp => {
-                                app.fetching = Some(Fetch::Uninstall);
-                                app.run(vec!["installs".into()]);
-                            }
-                        }
+                    crossterm::event::KeyCode::Enter => activate_menu(&mut app),
+                    crossterm::event::KeyCode::PageUp => {
+                        log_bottom = false;
+                    }
+                    crossterm::event::KeyCode::PageDown => {
+                        log_bottom = true;
                     }
                     crossterm::event::KeyCode::Esc => break,
                     crossterm::event::KeyCode::Char('c')
@@ -665,6 +712,48 @@ fn main() -> io::Result<()> {
                     log_stored = log_stored.saturating_sub(2);
                 }
                 crossterm::event::MouseEventKind::ScrollDown => log_bottom = true,
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                    let (mx, my) = (mouse.column, mouse.row);
+                    if app.dialog.is_some() {
+                        // inside the dialog list?
+                        if my >= hit_dialog_list.y && my < hit_dialog_list.y + hit_dialog_list.height
+                            && mx >= hit_dialog_list.x
+                        {
+                            if let Some(d) = app.dialog.as_mut() {
+                                let idx = (my - hit_dialog_list.y) as usize;
+                                d.sel = idx.min(d.items.len() - 1);
+                                if d.sel as u16 == my - hit_dialog_list.y
+                                    && d.items.len() > 0
+                                    && (d.sel as u16) == my - hit_dialog_list.y
+                                    && last_click == Some((mx, my))
+                                {
+                                    confirm_dialog(&mut app);
+                                    last_click = None;
+                                } else {
+                                    last_click = Some((mx, my));
+                                }
+                            }
+                        } else {
+                            // click outside the dialog closes it
+                            app.dialog = None;
+                            last_click = None;
+                        }
+                    } else if my >= hit_menu_list.y
+                        && my < hit_menu_list.y + hit_menu_list.height
+                        && mx >= hit_menu_list.x
+                    {
+                        let idx = ((my - hit_menu_list.y) as usize).min(MENU.len() - 1);
+                        if idx == app.selection && last_click.is_some() {
+                            activate_menu(&mut app);
+                            last_click = None;
+                        } else {
+                            app.selection = idx;
+                            last_click = Some((mx, my));
+                        }
+                    } else {
+                        last_click = None;
+                    }
+                }
                 _ => {}
             },
             _ => {}
