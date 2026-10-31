@@ -497,18 +497,12 @@ fn render_value(value: &Value, base: Color) -> Vec<Line<'static>> {
             .flat_map(|(key, val)| {
                 let shown = match val {
                     Value::String(s) => s.clone(),
-                    Value::Null => "empty".to_string(),
-                    other => {
-                        let compact = serde_json::to_string(other).unwrap_or_default();
-                        if compact.len() > 200 {
-                            format!("{}…", &compact[..200])
-                        } else {
-                            compact
-                        }
-                    }
+                    Value::Null => "—".to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    other => compact(other),
                 };
                 vec![Line::from(vec![
-                    Span::styled(format!("  {key}"), st(CY)),
+                    Span::styled(format!("  {}", humanize(key)), st(CY)),
                     Span::styled(format!("   {shown}"), st(base)),
                 ])]
             })
@@ -527,8 +521,114 @@ fn command_view(cmd: &str, data: &Value) -> Vec<Line<'static>> {
         "doctor" => doctor_view(data),
         "devices" => devices_view(data),
         "installs" => installs_view(data),
+        "device-info" => kv_view(data),
+        "version" => vec![Line::from(Span::styled(
+            format!(
+                "engine {}",
+                match data.get("version").and_then(Value::as_str) {
+                    Some(v) => v.to_string(),
+                    None => data.to_string(),
+                }
+            ),
+            st(CY).add_modifier(Modifier::BOLD),
+        ))],
+        // accounts/slots output is a dict of account/device summaries
+        "login" if data.get("accounts").is_some() || data.get("authenticated").is_some() => {
+            login_status_view(data)
+        }
         _ => render_value(data, Color::White),
     }
+}
+
+/// "ios_version" → "iOS Version"; "udid" → "UDID"
+fn humanize(key: &str) -> String {
+    key.split(['_', '-'])
+        .filter(|part| !part.is_empty())
+        .map(|part| match part {
+            "ios" => "iOS".to_string(),
+            "udid" | "uuid" | "ecid" | "id" | "anisette" | "url" | "gsm" => part.to_uppercase(),
+            "app" => "App".to_string(),
+            other => {
+                let mut c = other.chars();
+                match c.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+                    None => String::new(),
+                }
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+fn compact(value: &Value) -> String {
+    let raw = serde_json::to_string(value).unwrap_or_default();
+    if raw.len() > 160 {
+        format!("{}…", &raw[..159])
+    } else {
+        raw
+    }
+}
+
+/// aligned two-column key/value panel (device-info & friends)
+fn kv_view(data: &Value) -> Vec<Line<'static>> {
+    let Some(map) = data.as_object() else {
+        return render_value(data, Color::White);
+    };
+    let width = map
+        .keys()
+        .map(|k| humanize(k).chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(24);
+    map.iter()
+        .map(|(key, value)| {
+            let shown = match value {
+                Value::Null => "—".to_string(),
+                Value::Bool(b) => b.to_string(),
+                other => compact(other),
+            };
+            Line::from(vec![
+                Span::styled(format!("{:>width$}  ", humanize(key), width = width), st(CY)),
+                Span::styled(shown, st(Color::White)),
+            ])
+        })
+        .collect()
+}
+
+/// accounts/slots summary: email + team table, or the generic fall-back
+fn login_status_view(data: &Value) -> Vec<Line<'static>> {
+    if let Some(state) = data.get("authenticated") {
+        let authed = state.as_bool().unwrap_or(false);
+        let email = data
+            .get("email")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        return vec![Line::from(vec![
+            Span::styled(if authed { "✓ " } else { "✗ " }, st(if authed { GRN } else { RED })),
+            Span::styled("signed in: ", st(GRAY)),
+            Span::styled(email.to_string(), st(Color::White).add_modifier(Modifier::BOLD)),
+        ])];
+    }
+    if let Some(list) = data.get("accounts").and_then(Value::as_array) {
+        let mut out = vec![];
+        for account in list {
+            let email = account.get("email").and_then(Value::as_str).unwrap_or("?");
+            let team = account.get("team_id").and_then(Value::as_str).unwrap_or("-");
+            let active = account.get("active").and_then(Value::as_bool).unwrap_or(false);
+            out.push(Line::from(vec![
+                Span::styled(if active { "● " } else { "○ " }, st(if active { GRN } else { GRAY })),
+                Span::styled(format!("{email:<34}"), st(Color::White)),
+                Span::styled(format!("team {team}"), st(GRAY)),
+            ]));
+        }
+        out.push(Line::from(Span::styled(
+            format!("
+  {} account(s)", list.len()),
+            st(GRAY),
+        )));
+        return out;
+    }
+    render_value(data, Color::White)
 }
 
 fn status_ink(status: &str) -> (&'static str, Color) {
@@ -1262,6 +1362,34 @@ mod tests {
         assert!(view[1].spans[0].content.contains("expired"), "expirado → badge");
         assert!(view[2].spans[0].content.contains("d left"), "dias → badge");
         assert!(view[0].spans[1].content.len() <= 20, "nome cortado a 20");
+    }
+
+    #[test]
+    fn humanize_keys() {
+        assert_eq!(humanize("ios_version"), "iOS Version");
+        assert_eq!(humanize("udid"), "UDID");
+        assert_eq!(humanize("bundle_id"), "Bundle ID");
+        assert_eq!(humanize("device_name"), "Device Name");
+    }
+
+    #[test]
+    fn kv_view_aligned() {
+        let d = serde_json::json!({"udid":"00008030","name":"iPhone","ios_version":"18.5"});
+        let view = kv_view(&d);
+        assert_eq!(view.len(), 3);
+        // chave mais longa tem 11; demais linhas alinhadas a 11 + 2
+        let first = view[0].spans[0].content.clone();
+        assert_eq!(first.chars().count(), 13);
+    }
+
+    #[test]
+    fn version_panel_and_login_accounts() {
+        let v = command_view("version", &serde_json::json!({"version":"1.2.10"}));
+        assert!(v[0].spans[0].content.contains("engine 1.2.10"));
+        let acc = command_view("login", &serde_json::json!({"accounts":[{"email":"a@b","team_id":"T1","active":true}]}));
+        assert!(acc[0].spans[0].content.contains("●"));
+        let auth = command_view("login", &serde_json::json!({"authenticated":true,"email":"a@b"}));
+        assert!(auth[0].spans[1].content.contains("signed in"));
     }
 
     #[test]
