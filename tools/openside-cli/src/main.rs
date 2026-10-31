@@ -184,6 +184,9 @@ struct Dialog {
 struct App {
     selection: usize,
     log: Vec<Line<'static>>,
+    /// per-command app view; replaces raw JSON dump in the output pane
+    panel: Vec<Line<'static>>,
+    last_cmd: String,
     spinner: Option<String>,
     devices: Option<Value>,
     dialog: Option<Dialog>,
@@ -200,6 +203,8 @@ impl App {
     fn new() -> Self {
         Self {
             selection: 0,
+            panel: vec![],
+            last_cmd: String::new(),
             log: vec![Line::from(Span::styled(
                 "openside — pick with ↑↓, run with ⏎",
                 st(GRAY),
@@ -226,7 +231,11 @@ impl App {
     fn run(&mut self, args: Vec<String>) {
         self.next_id += 1;
         let id = self.next_id;
-        self.push(Line::from(Span::styled(format!("» run {}", args.join(" ")), st(CY))));
+        self.last_cmd = args.first().cloned().unwrap_or_default();
+        self.push(Line::from(Span::styled(
+            format!("» run {}", args.join(" ")),
+            st(CY),
+        )));
         STAGED.with(|s| {
             s.borrow_mut()
                 .push((id, serde_json::to_string(&args).unwrap_or_default()))
@@ -249,14 +258,13 @@ impl App {
             Some("result") => {
                 self.spinner = None;
                 let ok = frame.get("ok").and_then(Value::as_bool).unwrap_or(false);
-                let (mark, col) = if ok { ("✓", GRN) } else { ("✗", RED) };
-                self.push(Line::from(Span::styled(mark, st(col))));
-                for line in render_value(
-                    frame.get("data").or_else(|| frame.get("error")).unwrap_or(&Value::Null),
-                    if ok { Color::White } else { RED },
-                ) {
-                    self.push(line);
-                }
+                let data = frame.get("data").unwrap_or(&Value::Null);
+                let err = frame.get("error").unwrap_or(&Value::Null);
+                self.panel = if ok {
+                    command_view(&self.last_cmd, data)
+                } else {
+                    render_value(err, RED)
+                };
                 // feed the app picker when that fetch was for uninstall
                 if ok && matches!(self.fetching, Some(Fetch::Uninstall)) {
                     self.fetching = None;
@@ -277,7 +285,12 @@ impl App {
             }
             Some("stderr") => {
                 let line = frame.get("line").and_then(Value::as_str).unwrap_or("");
-                self.push(Line::from(Span::styled(line.to_string(), st(RED))));
+                let red = Line::from(Span::styled(line.to_string(), st(RED)));
+                if !self.panel.is_empty() {
+                    self.panel.push(red);
+                } else {
+                    self.log.push(red);
+                }
             }
             _ => {
                 let text = serde_json::to_string(&frame).unwrap_or_default();
@@ -381,6 +394,109 @@ fn render_value(value: &Value, base: Color) -> Vec<Line<'static>> {
         Value::Array(items) => items.iter().flat_map(|v| render_value(v, base)).collect(),
         Value::Null => vec![Line::from(Span::styled("  · empty", st(GRAY)))],
     }
+}
+
+// ---- per-command app views (panels replace raw JSON) ----
+fn command_view(cmd: &str, data: &Value) -> Vec<Line<'static>> {
+    match cmd {
+        "doctor" => doctor_view(data),
+        "devices" => devices_view(data),
+        "installs" => installs_view(data),
+        _ => render_value(data, Color::White),
+    }
+}
+
+fn status_ink(status: &str) -> (&'static str, Color) {
+    match status {
+        "fail" | "expired" => ("✗", RED),
+        "warn" => ("!", YEL),
+        _ => ("✓", GRN),
+    }
+}
+
+fn doctor_view(data: &Value) -> Vec<Line<'static>> {
+    let mut out = vec![];
+    let overall = data.get("overall").and_then(Value::as_str).unwrap_or("fail");
+    let (mark, col) = status_ink(overall);
+    out.push(Line::from(Span::styled(
+        format!("{mark} overall: {overall}"),
+        st(col).add_modifier(Modifier::BOLD),
+    )));
+    if let Some(checks) = data.get("checks").and_then(Value::as_array) {
+        for check in checks {
+            let name = check.get("name").and_then(Value::as_str).unwrap_or("?");
+            let status = check.get("status").and_then(Value::as_str).unwrap_or("fail");
+            let detail = check.get("detail").and_then(Value::as_str).unwrap_or("");
+            let (mark, col) = status_ink(status);
+            out.push(Line::from(vec![
+                Span::styled(format!("{mark} "), st(col)),
+                Span::styled(format!("{name:<22}"), st(Color::White)),
+                Span::styled(detail.to_string(), st(GRAY)),
+            ]));
+        }
+    }
+    out
+}
+
+fn devices_view(data: &Value) -> Vec<Line<'static>> {
+    let Some(list) = data.as_array() else {
+        return render_value(data, Color::White);
+    };
+    if list.is_empty() {
+        return vec![Line::from(Span::styled(
+            "○ no iPhone connected — plug in via USB, unlock, tap Trust",
+            st(GRAY),
+        ))];
+    }
+    list.iter()
+        .map(|d| {
+            let serial = d.get("serial").and_then(Value::as_str).unwrap_or("?");
+            let tail = &serial[serial.len().saturating_sub(8)..];
+            let conn = d.get("connection_type").and_then(Value::as_str).unwrap_or("?");
+            let id = d.get("device_id").map(Value::to_string).unwrap_or_default();
+            Line::from(vec![
+                Span::styled("● ", st(GRN)),
+                Span::styled("iPhone  ", st(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{conn}  …{tail}  id {id}"), st(GRAY)),
+            ])
+        })
+        .collect()
+}
+
+fn installs_view(data: &Value) -> Vec<Line<'static>> {
+    let Some(list) = data.as_array() else {
+        return render_value(data, Color::White);
+    };
+    if list.is_empty() {
+        return vec![Line::from(Span::styled(
+            "· nothing sideloaded yet",
+            st(GRAY),
+        ))];
+    }
+    list.iter()
+        .map(|r| {
+            let name = r.get("name").and_then(Value::as_str).unwrap_or("?");
+            let bundle = r.get("bundle_id").and_then(Value::as_str).unwrap_or("?");
+            let expired = r.get("expired").and_then(Value::as_bool).unwrap_or(false);
+            let days = r.get("days_left").and_then(Value::as_f64);
+            let (badge, col) = if expired {
+                ("✗ expired".to_string(), RED)
+            } else if let Some(d) = days.filter(|&d| d <= 2.0) {
+                (format!("◐ {d:.0}d left"), RED)
+            } else if let Some(d) = days.filter(|&d| d <= 7.0) {
+                (format!("◐ {d:.0}d left"), YEL)
+            } else if let Some(d) = days {
+                (format!("● {d:.0}d left"), GRN)
+            } else {
+                ("● unknown".to_string(), GRAY)
+            };
+            Line::from(vec![
+                Span::styled(format!("{badge:<11} "), st(col)),
+                Span::styled(format!("{name:<20.20}"), st(Color::White)),
+                Span::styled(bundle.to_string(), st(GRAY)),
+            ])
+        })
+        .collect()
 }
 
 // ---- header logo, half-block rendering ----
@@ -593,15 +709,28 @@ fn main() -> io::Result<()> {
                 menu_cols[1],
             );
 
-            let log_inner = box_title(f, body[1], &format!("output — {} lines", app.log.len()), MAG);
-            let vis = log_inner.height.saturating_sub(1);
-            let scroll = real_scroll(app.log.len(), vis, log_stored, log_bottom);
-            f.render_widget(
-                Paragraph::new(app.log.clone())
-                    .style(Style::new().bg(BG))
-                    .scroll((scroll, 0)),
-                log_inner,
-            );
+            let panel_live = !app.panel.is_empty();
+            let title = if panel_live {
+                format!("{} ", if app.last_cmd.is_empty() { "output" } else { &app.last_cmd })
+            } else {
+                format!("ticker — {} lines", app.log.len())
+            };
+            let log_inner = box_title(f, body[1], &title, MAG);
+            if panel_live {
+                f.render_widget(
+                    Paragraph::new(app.panel.clone()).style(Style::new().bg(BG)),
+                    log_inner,
+                );
+            } else {
+                let vis = log_inner.height.saturating_sub(1);
+                let scroll = real_scroll(app.log.len(), vis, log_stored, log_bottom);
+                f.render_widget(
+                    Paragraph::new(app.log.clone())
+                        .style(Style::new().bg(BG))
+                        .scroll((scroll, 0)),
+                    log_inner,
+                );
+            }
 
             // footer
             f.render_widget(
@@ -797,6 +926,43 @@ mod tests {
         assert_eq!(dialog.items.len(), 2);
         assert!(matches!(dialog.items[1].1, Choice::Uninstall(ref b) if b == "x.app"));
         assert!(dialog.title.contains("uninstall"));
+    }
+
+    #[test]
+    fn doctor_panel() {
+        let d: Value = serde_json::from_str(
+            r#"{"overall":"ok","checks":[{"name":"Python runtime","status":"ok","detail":"Python 3.14"},{"name":"AMDS","status":"fail","detail":"not found"}]}"#,
+        )
+        .unwrap();
+        let view = doctor_view(&d);
+        assert_eq!(view.len(), 3, "cabeçalho + 2 checks");
+        assert!(view[0].spans[0].content.contains("overall"));
+        assert!(view[2].spans[0].content.contains("✗"), "check fail → ✗");
+    }
+
+    #[test]
+    fn installs_panel() {
+        let d: Value = serde_json::from_str(
+            r#"[{"name":"Um batismo de nome comprido demais","bundle_id":"a.b","expired":false,"days_left":30},
+                {"name":"FWhtUf","bundle_id":"c.d","expired":true,"days_left":null},
+                {"name":"Y","bundle_id":"e.f","expired":false,"days_left":1.5}]"#,
+        )
+        .unwrap();
+        let view = installs_view(&d);
+        assert_eq!(view.len(), 3);
+        assert!(view[1].spans[0].content.contains("expired"), "expirado → badge");
+        assert!(view[2].spans[0].content.contains("d left"), "dias → badge");
+        assert!(view[0].spans[1].content.len() <= 20, "nome cortado a 20");
+    }
+
+    #[test]
+    fn devices_panel() {
+        let empty = devices_view(&serde_json::json!([]));
+        assert!(empty[0].spans[0].content.contains("no iPhone"));
+        let d = serde_json::json!([{"serial":"00008030-0009454E0C84802E","connection_type":"USB","device_id":1}]);
+        let rows = devices_view(&d);
+        assert!(rows[0].spans[2].content.contains("402E"));
+        assert!(rows[0].spans[0].content.contains("●"));
     }
 
     #[test]
