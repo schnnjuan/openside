@@ -743,9 +743,9 @@ const BOT_PNG: &[u8] = include_bytes!("assets/openside.png");
 const BOT_ROWS: u16 = 12;
 
 /// carrega a arte: compõe o alpha sobre o fundo do app (o halfblocks
-/// compõe alpha como preto) e faz o resize Nearest no grid exato de células
-/// — o encoder do halfblocks sempre re-resiza com Triangle, então a imagem
-/// precisa já chegar no tamanho final pra virar no-op
+/// compõe alpha como preto) e coloca cada pixel da arte em px inteiros
+/// do grid do terminal — o encoder do halfblocks sempre re-resiza com
+/// Triangle, então a imagem precisa chegar em no-op pra ficar nítida
 fn bot_protocol() -> Option<Bot> {
     let img = image::load_from_memory(BOT_PNG).ok()?.into_rgba8();
 
@@ -764,25 +764,45 @@ fn bot_protocol() -> Option<Bot> {
     )
     .to_image();
 
-    let mut canvas = image::RgbaImage::from_pixel(
-        cropped.width(),
-        cropped.height(),
-        image::Rgba([0x01, 0x2D, 0x2D, 255]),
-    );
+    let bg = image::Rgba([0x01, 0x2D, 0x2D, 255]);
+    let mut canvas = image::RgbaImage::from_pixel(cropped.width(), cropped.height(), bg);
     image::imageops::overlay(&mut canvas, &cropped, 0, 0);
 
     let picker = ratatui_image::picker::Picker::halfblocks();
     let fs = picker.font_size();
+    let (fs_w, fs_h) = (u32::from(fs.width), u32::from(fs.height));
     let cols = ((BOT_ROWS as f32 * fs.height as f32 * canvas.width() as f32)
         / (fs.width as f32 * canvas.height() as f32))
         .ceil() as u16;
 
-    let target = image::imageops::resize(
+    // nearest no grid exato de células (encoder vira no-op…)…
+    let mut target = image::imageops::resize(
         &canvas,
-        u32::from(cols) * u32::from(fs.width),
-        u32::from(BOT_ROWS) * u32::from(fs.height),
+        u32::from(cols) * fs_w,
+        u32::from(BOT_ROWS) * fs_h,
         image::imageops::FilterType::Nearest,
     );
+    // …eé quantiza aos 19 tons da paleta: o anti-aliasing amostrado pelo
+    // nearest vira pixels sujos — volta a cor do bloco mais próximo
+    const PAL: [[u8; 3]; 19] = [
+        [0x02, 0x6D, 0x4F], [0x02, 0x61, 0x48], [0x04, 0x47, 0x38], [0x64, 0xE0, 0xA4],
+        [0x24, 0xA0, 0x67], [0x01, 0x2D, 0x2D], [0xFD, 0xD8, 0xBC], [0xED, 0xB8, 0x9C],
+        [0xED, 0x87, 0x68], [0xDF, 0x73, 0x59], [0xAE, 0x55, 0x44], [0x84, 0x2A, 0xA9],
+        [0xAA, 0x4E, 0xCB], [0x62, 0x17, 0x81], [0xBD, 0xB4, 0xDA], [0xBE, 0x9D, 0x7A],
+        [0x34, 0x22, 0x21], [0xFF, 0xFF, 0xFF], [0x00, 0x00, 0x00],
+    ];
+    for pxzi in target.pixels_mut() {
+        let (r, g, b) = (pxzi.0[0], pxzi.0[1], pxzi.0[2]);
+        let (py, pg, pb) = (i32::from(r), i32::from(g), i32::from(b));
+        let (mut br, mut bg2, mut bb, mut bd) = (0, 0, 0, i32::MAX);
+        for &[pr, pq, pbk] in &PAL {
+            let d = (py - i32::from(pr)).pow(2) + (pg - i32::from(pq)).pow(2) + (pb - i32::from(pbk)).pow(2);
+            if d < bd {
+                (br, bg2, bb, bd) = (pr, pq, pbk, d);
+            }
+        }
+        *pxzi = image::Rgba([br, bg2, bb, 255]);
+    }
 
     picker
         .new_protocol(
