@@ -135,53 +135,127 @@ impl Drop for Engine {
 // ---- actions ----
 /// What happens when the user picks something in a dialog.
 enum Choice {
-    Sideload(String),  // ipa path
     Uninstall(String), // bundle id
+    Refresh(String),   // bundle id
+    Forget(String),    // bundle id
+    /// arbitrary `<cmd> <one-arg>` (inspect/sign .ipa)
+    RunWith(String, String),
+}
+
+enum DialogKind {
+    Pick { items: Vec<(String, Choice)>, sel: usize },
+    Input { prompt: String, masked: bool, buffer: String },
 }
 
 enum Item {
+    /// non-selectable group title
+    Header,
     /// engine command, no interaction needed
     Run(&'static str),
-    /// open the .ipa picker, then run `sideload <path>`
-    PickIpa,
-    /// fetch installs, pick an app, then run `uninstall <bundle>`
-    PickApp,
+    /// open the .ipa picker, then run `<cmd> <path>`
+    PickIpa(&'static str),
+    /// fetch installs, pick an app, then run the mapped command
+    PickApp(AppAction),
+    /// sign in to an Apple ID (email → password → 2FA wizard)
+    Login,
+}
+
+#[derive(Clone, Copy)]
+enum AppAction {
+    Uninstall,
+    Forget,
+    RefreshOne,
+}
+
+impl Item {
+    fn selectable(&self) -> bool {
+        !matches!(self, Item::Header)
+    }
 }
 
 /// aligned with MENU — one-line description shown under the list
 const MENU_DESC: &[&str] = &[
+    "getting started",
     "engine self-check",
     "connected iPhones",
     "selected device details",
-    "sideloaded apps + expiry",
-    "cached signed .ipas",
-    "anisette provisioning status",
-    "engine build",
+    "sign in to an Apple ID",
+    "sideloading",
     "sign + install an .ipa",
-    "remove a sideloaded app",
+    "sign an .ipa into a new file",
+    "sideloaded apps + expiry",
     "re-sign apps expiring soon",
+    "re-sign one app by record",
+    "cached signed .ipas",
+    "apple id",
+    "development teams on the account",
+    "certs / app ids / devices slots",
+    "every signed-in Apple ID",
+    "device",
+    "show developer mode state",
+    "pairing file status",
+    "Dopamine advice",
+    "apps on the device",
+    "details for one device",
+    "ipa tooling",
+    "read an .ipa metadata",
+    "infrastructure",
+    "anisette provisioning status",
+    "Apple USB device-support status",
+    "remove a sideload record",
+    "remove a sideloaded app",
+    "engine build",
 ];
 
 const MENU: &[(&str, Item)] = &[
+    ("— getting started", Item::Header),
     ("doctor", Item::Run("doctor")),
     ("devices", Item::Run("devices")),
     ("device-info", Item::Run("device-info")),
+    ("login apple id…", Item::Login),
+    ("— sideloading", Item::Header),
+    ("sideload an .ipa…", Item::PickIpa("sideload")),
+    ("sign an .ipa…", Item::PickIpa("sign")),
     ("installs", Item::Run("installs")),
-    ("signed .ipas", Item::Run("signed")),
-    ("anisette status", Item::Run("anisette")),
-    ("version", Item::Run("version")),
-    ("sideload an .ipa…", Item::PickIpa),
-    ("uninstall an app…", Item::PickApp),
     ("refresh expiring", Item::Run("refresh")),
+    ("refresh one app…", Item::PickApp(AppAction::RefreshOne)),
+    ("signed .ipas", Item::Run("signed")),
+    ("— apple id", Item::Header),
+    ("teams", Item::Run("teams")),
+    ("slots", Item::Run("slots")),
+    ("accounts", Item::Run("login --accounts")),
+    ("— device", Item::Header),
+    ("developer-mode", Item::Run("developer-mode")),
+    ("pairing", Item::Run("pairing")),
+    ("jailbreak", Item::Run("jailbreak")),
+    ("installed apps", Item::Run("apps")),
+    ("device-info", Item::Run("device-info")),
+    ("— ipa tooling", Item::Header),
+    ("inspect an .ipa…", Item::PickIpa("inspect")),
+    ("— infrastructure", Item::Header),
+    ("anisette status", Item::Run("anisette")),
+    ("apple-support", Item::Run("apple-support")),
+    ("forget an app…", Item::PickApp(AppAction::Forget)),
+    ("uninstall an app…", Item::PickApp(AppAction::Uninstall)),
+    ("version", Item::Run("version")),
 ];
 
 struct Dialog {
     title: String,
-    items: Vec<(String, Choice)>,
-    sel: usize,
+    kind: DialogKind,
+}
+
+/// login wizard: email collected first, then the app-specific password,
+/// then the 2FA code. Password hits disk only inside an 0600 temp file the
+/// engine reads per request; removed as soon as login answers.
+struct LoginFlow {
+    email: String,
+    password: String,
+    creds: std::path::PathBuf,
 }
 
 struct App {
+    login: Option<LoginFlow>,
     selection: usize,
     log: Vec<Line<'static>>,
     /// per-command app view; replaces raw JSON dump in the output pane
@@ -190,18 +264,40 @@ struct App {
     spinner: Option<String>,
     devices: Option<Value>,
     dialog: Option<Dialog>,
-    /// set while an `installs` fetch is in flight to feed the app picker
-    fetching: Option<Fetch>,
+    /// app action waiting for the next `installs` result
+    app_action: Option<AppAction>,
     next_id: u64,
 }
 
-enum Fetch {
-    Uninstall,
+fn write_creds(email: &str, password: &str) -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("openside-login-{}-{nonce}.json", std::process::id()));
+    let body = serde_json::json!({ "email": email, "password": password });
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&path).expect("create creds file");
+        f.write_all(body.to_string().as_bytes()).expect("write creds");
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(0o600),
+        );
+    }
+    path
+}
+
+fn drop_creds(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
 }
 
 impl App {
     fn new() -> Self {
         Self {
+            login: None,
             selection: 0,
             panel: vec![],
             last_cmd: String::new(),
@@ -212,7 +308,7 @@ impl App {
             spinner: None,
             devices: None,
             dialog: None,
-            fetching: None,
+            app_action: None,
             next_id: 1,
         }
     }
@@ -265,13 +361,38 @@ impl App {
                 } else {
                     render_value(err, RED)
                 };
-                // feed the app picker when that fetch was for uninstall
-                if ok && matches!(self.fetching, Some(Fetch::Uninstall)) {
-                    self.fetching = None;
-                    if let Some(dialog) = app_picker(frame.get("data").unwrap_or(&Value::Null)) {
-                        self.dialog = Some(dialog);
+                // the next `installs` result after an app action feeds the picker
+                if ok && self.app_action.is_some() {
+                    if let Some(action) = self.app_action.take() {
+                        let data = frame.get("data").unwrap_or(&Value::Null);
+                        let picker = app_picker(data, choice_for(action));
+                        if let Some(dialog) = picker {
+                            self.dialog = Some(dialog);
+                        } else {
+                            self.note("no sideloaded apps recorded");
+                        }
+                    }
+                }
+                // login wizard lifecycle
+                if self.last_cmd == "login" {
+                    let status = frame
+                        .get("data")
+                        .and_then(|d| d.get("status"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("ok");
+                    if ok && status == "2fa_required" && self.login.is_some() {
+                        self.dialog = Some(Dialog {
+                            title: "2FA code:".into(),
+                            kind: DialogKind::Input {
+                                prompt: "2FA code:".into(),
+                                masked: true,
+                                buffer: String::new(),
+                            },
+                        });
                     } else {
-                        self.note("no sideloaded apps recorded");
+                        if let Some(flow) = self.login.take() {
+                            drop_creds(&flow.creds);
+                        }
                     }
                 }
             }
@@ -305,18 +426,15 @@ thread_local! {
     static STAGED: std::cell::RefCell<Vec<(u64, String)>> = std::cell::RefCell::new(vec![]);
 }
 
-/// installs JSON records (name/bundle_id/…) → uninstall picker
-fn app_picker(data: &Value) -> Option<Dialog> {
+/// installs JSON records (name/bundle_id/…) → app-action picker
+fn app_picker(data: &Value, make_choice: fn(String) -> Choice) -> Option<Dialog> {
     let mut items = Vec::new();
     if let Some(list) = data.as_array() {
         for record in list {
             let bundle = record.get("bundle_id").and_then(Value::as_str);
             if let Some(bundle) = bundle {
                 let name = record.get("name").and_then(Value::as_str).unwrap_or(bundle);
-                items.push((
-                    format!("{name} — {bundle}"),
-                    Choice::Uninstall(bundle.to_string()),
-                ));
+                items.push((format!("{name} — {bundle}"), make_choice(bundle.to_string())));
             }
         }
     }
@@ -324,10 +442,17 @@ fn app_picker(data: &Value) -> Option<Dialog> {
         return None;
     }
     Some(Dialog {
-        title: "uninstall which app?".into(),
-        items,
-        sel: 0,
+        title: "which app?".into(),
+        kind: DialogKind::Pick { items, sel: 0 },
     })
+}
+
+fn choice_for(action: AppAction) -> fn(String) -> Choice {
+    match action {
+        AppAction::Uninstall => Choice::Uninstall,
+        AppAction::Forget => Choice::Forget,
+        AppAction::RefreshOne => Choice::Refresh,
+    }
 }
 
 /// scan common dirs for sideloadable .ipas (env override: OPENSIDE_IPA_DIRS)
@@ -563,6 +688,48 @@ fn real_scroll(len: usize, height: u16, stored: u16, bottom: bool) -> u16 {
     }
 }
 
+fn relative_selection(from: usize, dir: i32, count: usize) -> usize {
+    let mut i = from;
+    loop {
+        if dir < 0 {
+            i = i.saturating_sub(1);
+        } else {
+            i = (i + 1).min(count - 1);
+        }
+        if dir < 0 && i == 0 && !MENU[0].1.selectable() {
+            return i;
+        }
+        if MENU[i].1.selectable() {
+            return i;
+        }
+        if i == 0 || (dir > 0 && i == count - 1 && !MENU[i].1.selectable()) {
+            return from;
+        }
+    }
+}
+
+/// open the .ipa picker for a command that takes a path
+fn open_ipa_picker(app: &mut App, cmd: &'static str) {
+    let found = ipa_candidates();
+    if found.is_empty() {
+        app.note("no .ipa in OPENSIDE_IPA_DIRS (default Downloads/Desktop/macos-vm/shared)");
+    } else {
+        app.dialog = Some(Dialog {
+            title: format!("{cmd} which .ipa?"),
+            kind: DialogKind::Pick {
+                items: found
+                    .into_iter()
+                    .map(|p| {
+                        let label = p.rsplit('/').next().unwrap_or(&p).to_string();
+                        (label, Choice::RunWith(cmd.to_string(), p))
+                    })
+                    .collect(),
+                sel: 0,
+            },
+        });
+    }
+}
+
 fn connected(devices: &Option<Value>) -> usize {
     devices
         .as_ref()
@@ -576,39 +743,116 @@ const FOOT: &str = " ↑↓/click pick · click again or ⏎ run · esc quit ";
 /// run the currently selected menu entry (key ⏎ or second click)
 fn activate_menu(app: &mut App) {
     match &MENU[app.selection].1 {
-        Item::Run(cmd) => app.run(vec![(*cmd).to_string()]),
-        Item::PickIpa => {
-            let found = ipa_candidates();
-            if found.is_empty() {
-                app.note("no .ipa in OPENSIDE_IPA_DIRS (default Downloads/Desktop/macos-vm/shared)");
-            } else {
-                app.dialog = Some(Dialog {
-                    title: "sideload which .ipa?".into(),
-                    items: found
-                        .into_iter()
-                        .map(|p| {
-                            let label = p.rsplit('/').next().unwrap_or(&p).to_string();
-                            (label, Choice::Sideload(p))
-                        })
-                        .collect(),
-                    sel: 0,
-                });
-            }
+        Item::Run(cmd) => {
+            let parts: Vec<String> = cmd.split_whitespace().map(String::from).collect();
+            app.run(parts);
         }
-        Item::PickApp => {
-            app.fetching = Some(Fetch::Uninstall);
+        Item::PickIpa(cmd) => open_ipa_picker(app, cmd),
+        Item::PickApp(action) => {
+            app.app_action = Some(*action);
             app.run(vec!["installs".into()]);
         }
+        Item::Login => start_login(app),
+        Item::Header => {}
+    }
+}
+
+fn start_login(app: &mut App) {
+    open_input_dialog(app, "Apple ID e-mail:", false);
+}
+
+fn open_input_dialog(app: &mut App, prompt: &str, masked: bool) {
+    app.dialog = Some(Dialog {
+        title: prompt.to_string(),
+        kind: DialogKind::Input {
+            prompt: prompt.to_string(),
+            masked,
+            buffer: String::new(),
+        },
+    });
+}
+
+/// submit a text-input dialog: drives the login wizard stages
+fn submit_input(app: &mut App, buffer: String) {
+    let value = buffer.trim().to_string();
+    let stage = match app.dialog.take() {
+        Some(dialog) => dialog.title,
+        None => return,
+    };
+    if value.is_empty() {
+        return;
+    }
+    if stage.contains("e-mail") {
+        let existed = app.login.is_some();
+        open_input_dialog(app, "app-specific password:", true);
+        app.login = Some(match app.login.take() {
+            Some(flow) => LoginFlow { email: value, ..flow },
+            None => LoginFlow {
+                email: value,
+                password: String::new(),
+                creds: std::path::PathBuf::new(),
+            },
+        });
+        let _notify = existed;
+        return;
+    }
+    if stage.contains("password") {
+        if let Some(flow) = app.login.as_mut() {
+            flow.password = value;
+            flow.creds = write_creds(&flow.email, &flow.password);
+        }
+        let email = app
+            .login
+            .as_ref()
+            .map(|f| f.email.clone())
+            .unwrap_or_default();
+        let creds = app
+            .login
+            .as_ref()
+            .map(|f| f.creds.display().to_string())
+            .unwrap_or_default();
+        app.run(vec![
+            "login".into(),
+            "--email".into(),
+            email,
+            "--creds-file".into(),
+            creds,
+        ]);
+        return;
+    }
+    if stage.contains("2FA") {
+        let (email, creds) = match app.login.as_ref() {
+            Some(flow) => (
+                flow.email.clone(),
+                flow.creds.display().to_string(),
+            ),
+            None => return,
+        };
+        app.run(vec![
+            "login".into(),
+            "--email".into(),
+            email,
+            "--creds-file".into(),
+            creds,
+            "--code".into(),
+            value,
+        ]);
     }
 }
 
 /// apply the chosen dialog item and close it
 fn confirm_dialog(app: &mut App) {
-    if let Some(mut dialog) = app.dialog.take() {
-        let (_, choice) = dialog.items.remove(dialog.sel);
-        match choice {
-            Choice::Sideload(path) => app.run(vec!["sideload".into(), path]),
-            Choice::Uninstall(bundle) => app.run(vec!["uninstall".into(), bundle]),
+    if let Some(dialog) = app.dialog.take() {
+        match dialog.kind {
+            DialogKind::Pick { items, sel } => match items.into_iter().nth(sel) {
+
+                Some((_, Choice::RunWith(cmd, arg))) => app.run(vec![cmd, arg]),
+                Some((_, Choice::Uninstall(bundle))) => app.run(vec!["uninstall".into(), bundle]),
+                Some((_, Choice::Refresh(bundle))) => app.run(vec!["refresh".into(), bundle]),
+                Some((_, Choice::Forget(bundle))) => app.run(vec!["forget".into(), bundle]),
+                _ => {}
+            },
+            _ => {}
         }
     }
 }
@@ -662,7 +906,7 @@ fn main() -> io::Result<()> {
                 .split(rows[0]);
             f.render_widget(Paragraph::new(logo_lines("openside")), header[0]);
             let n_devices = connected(&app.devices);
-            let busy = app.spinner.is_some() || app.fetching.is_some();
+            let busy = app.spinner.is_some() || app.app_action.is_some();
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(" anx set ", Style::new().fg(DARK).bg(GRAY)),
@@ -688,15 +932,20 @@ fn main() -> io::Result<()> {
                 );
             hit_menu_list = menu_cols[0];
             let mut list = ListState::default();
-            list.select(Some(app.selection));
+            if MENU[app.selection].1.selectable() {
+                list.select(Some(app.selection));
+            }
+            let items = MENU
+                .iter()
+                .map(|(name, item)| match item {
+                    Item::Header => format!("  {name}"),
+                    _ => format!(" ▪ {name}"),
+                })
+                .collect::<Vec<String>>();
             f.render_stateful_widget(
-                List::new(
-                    MENU.iter()
-                        .map(|(name, _)| format!("▪ {name}"))
-                        .collect::<Vec<String>>(),
-                )
-                .highlight_symbol("» ")
-                .highlight_style(st(Color::White).add_modifier(Modifier::BOLD)),
+                List::new(items)
+                    .highlight_symbol("» ")
+                    .highlight_style(st(Color::White).add_modifier(Modifier::BOLD)),
                 menu_cols[0],
                 &mut list,
             );
@@ -742,7 +991,7 @@ fn main() -> io::Result<()> {
                     .style(Style::new().bg(DARK)),
                 rows[2],
             );
-            let status_text = match (&app.spinner, &app.fetching) {
+            let status_text = match (&app.spinner, &app.app_action) {
                 (Some(line), _) => format!("{line}… "),
                 (_, Some(_)) => "fetching app list… ".to_string(),
                 _ => format!("ready · {} connected", connected(&app.devices)),
@@ -759,26 +1008,61 @@ fn main() -> io::Result<()> {
 
             // dialog overlay (last = on top)
             if let Some(dlog) = &app.dialog {
-                let width = (57.min(area.width.saturating_sub(4))).max(20);
-                let height = (dlog.items.len() as u16 + 5).min(rows[1].height.saturating_sub(2));
-                let x = area.x + (area.width.saturating_sub(width)) / 2;
-                let y = rows[1].y + (rows[1].height.saturating_sub(height)) / 2;
-                let inner = box_title(f, Rect { x, y, width, height }, &dlog.title, YEL);
-                hit_dialog_list = inner;
-                let mut dsel = ListState::default();
-                dsel.select(Some(dlog.sel));
-                f.render_stateful_widget(
-                    List::new(
-                        dlog.items
-                            .iter()
-                            .map(|(label, _)| label.clone())
-                            .collect::<Vec<String>>(),
-                    )
-                    .highlight_symbol("» ")
-                    .highlight_style(st(Color::White).add_modifier(Modifier::BOLD)),
-                    inner,
-                    &mut dsel,
-                );
+                match &dlog.kind {
+                    DialogKind::Pick { items, .. } => {
+                        let width = (57.min(area.width.saturating_sub(4))).max(20);
+                        let height =
+                            (items.len() as u16 + 5).min(rows[1].height.saturating_sub(2));
+                        let x = area.x + (area.width.saturating_sub(width)) / 2;
+                        let y = rows[1].y + (rows[1].height.saturating_sub(height)) / 2;
+                        let inner = box_title(f, Rect { x, y, width, height }, &dlog.title, YEL);
+                        hit_dialog_list = inner;
+                        let sel_now = match &dlog.kind {
+                            DialogKind::Pick { sel, .. } => *sel,
+                            _ => 0,
+                        };
+                        let mut dsel = ListState::default();
+                        dsel.select(Some(sel_now));
+                        f.render_stateful_widget(
+                            List::new(
+                                items.iter().map(|(label, _)| label.clone()).collect::<Vec<String>>(),
+                            )
+                            .highlight_symbol("» ")
+                            .highlight_style(st(Color::White).add_modifier(Modifier::BOLD)),
+                            inner,
+                            &mut dsel,
+                        );
+                    }
+                    DialogKind::Input { prompt, masked, buffer } => {
+                        let shown = if *masked && !buffer.is_empty() {
+                            "●".repeat(buffer.len())
+                        } else if buffer.is_empty() {
+                            "▮".to_string()
+                        } else {
+                            format!("{buffer}▮")
+                        };
+                        let width = 46.min(area.width.saturating_sub(4)).max(24);
+                        let height = 5.min(rows[1].height.saturating_sub(2));
+                        let x = area.x + (area.width.saturating_sub(width)) / 2;
+                        let y = rows[1].y + (rows[1].height.saturating_sub(height)) / 2;
+                        let inner = box_title(f, Rect { x, y, width, height }, &dlog.title, YEL);
+                        hit_dialog_list = inner;
+                        let dims: [Rect; 2] =
+                            Layout::vertical([Constraint::Length(1), Constraint::Min(0)])
+                                .areas(inner);
+                        f.render_widget(
+                            Paragraph::new(Line::from(Span::styled(
+                                format!("  {prompt}"),
+                                st(GRAY).add_modifier(Modifier::DIM),
+                            ))),
+                            dims[0],
+                        );
+                        f.render_widget(
+                            Paragraph::new(Line::from(Span::styled(shown, st(Color::White).add_modifier(Modifier::BOLD)))),
+                            dims[1],
+                        );
+                    }
+                }
             }
         })?;
 
@@ -787,35 +1071,60 @@ fn main() -> io::Result<()> {
         }
         let ev = crossterm::event::read()?;
         // dialog consumes navigation first
-        if let Some(dialog) = app.dialog.as_mut() {
+        if let Some(Dialog { title: _, kind }) = app.dialog.as_mut() {
             if let crossterm::event::Event::Key(key) = &ev {
                 if key.kind == crossterm::event::KeyEventKind::Press {
-                    match key.code {
-                        crossterm::event::KeyCode::Up => dialog.sel = dialog.sel.saturating_sub(1),
-                        crossterm::event::KeyCode::Down => {
-                            dialog.sel = (dialog.sel + 1).min(dialog.items.len() - 1)
-                        }
-                        crossterm::event::KeyCode::PageUp => dialog.sel = dialog.sel.saturating_sub(10),
-                        crossterm::event::KeyCode::PageDown => {
-                            dialog.sel = (dialog.sel + 10).min(dialog.items.len() - 1)
-                        }
-                        crossterm::event::KeyCode::Esc => app.dialog = None,
-                        crossterm::event::KeyCode::Enter => confirm_dialog(&mut app),
-                        _ => {}
+                    match kind {
+                        DialogKind::Pick { items, sel } => match key.code {
+                            crossterm::event::KeyCode::Up => *sel = sel.saturating_sub(1),
+                            crossterm::event::KeyCode::Down => {
+                                *sel = (*sel + 1).min(items.len().saturating_sub(1))
+                            }
+                            crossterm::event::KeyCode::PageUp => {
+                                *sel = sel.saturating_sub(10)
+                            }
+                            crossterm::event::KeyCode::PageDown => {
+                                *sel = (*sel + 10).min(items.len().saturating_sub(1))
+                            }
+                            crossterm::event::KeyCode::Esc => app.dialog = None,
+                            crossterm::event::KeyCode::Enter => confirm_dialog(&mut app),
+                            _ => {}
+                        },
+                        DialogKind::Input { buffer, .. } => match key.code {
+                            crossterm::event::KeyCode::Esc => {
+                                // abandon a wizard: nothing sent yet in this stage
+                                if let Some(flow) = app.login.take() {
+                                    drop_creds(&flow.creds);
+                                }
+                                app.dialog = None;
+                            }
+                            crossterm::event::KeyCode::Enter => {
+                                let buffer = buffer.clone();
+                                submit_input(&mut app, buffer);
+                            }
+                            crossterm::event::KeyCode::Backspace => {
+                                buffer.pop();
+                            }
+                            crossterm::event::KeyCode::Char(c) => buffer.push(c),
+                            _ => {}
+                        },
                     }
                     continue;
                 }
             }
             continue;
         }
+
         match ev {
             crossterm::event::Event::Key(key)
                 if key.kind == crossterm::event::KeyEventKind::Press =>
             {
                 match key.code {
-                    crossterm::event::KeyCode::Up => app.selection = app.selection.saturating_sub(1),
+                    crossterm::event::KeyCode::Up => {
+                        app.selection = relative_selection(app.selection, -1, MENU.len())
+                    }
                     crossterm::event::KeyCode::Down => {
-                        app.selection = (app.selection + 1).min(MENU.len() - 1)
+                        app.selection = relative_selection(app.selection, 1, MENU.len())
                     }
                     crossterm::event::KeyCode::Home => app.selection = 0,
                     crossterm::event::KeyCode::End => app.selection = MENU.len() - 1,
@@ -844,26 +1153,24 @@ fn main() -> io::Result<()> {
                 crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                     let (mx, my) = (mouse.column, mouse.row);
                     if app.dialog.is_some() {
-                        // inside the dialog list?
-                        if my >= hit_dialog_list.y && my < hit_dialog_list.y + hit_dialog_list.height
+                        if my >= hit_dialog_list.y
+                            && my < hit_dialog_list.y + hit_dialog_list.height
                             && mx >= hit_dialog_list.x
                         {
-                            if let Some(d) = app.dialog.as_mut() {
-                                let idx = (my - hit_dialog_list.y) as usize;
-                                d.sel = idx.min(d.items.len() - 1);
-                                if d.sel as u16 == my - hit_dialog_list.y
-                                    && d.items.len() > 0
-                                    && (d.sel as u16) == my - hit_dialog_list.y
-                                    && last_click == Some((mx, my))
-                                {
-                                    confirm_dialog(&mut app);
-                                    last_click = None;
-                                } else {
-                                    last_click = Some((mx, my));
+                            if let Some(Dialog { kind, .. }) = app.dialog.as_mut() {
+                                if let DialogKind::Pick { items, sel } = kind {
+                                    let idx = (my - hit_dialog_list.y) as usize;
+                                    let idx = idx.min(items.len().saturating_sub(1));
+                                    if idx == *sel && last_click == Some((mx, my)) {
+                                        confirm_dialog(&mut app);
+                                        last_click = None;
+                                    } else {
+                                        *sel = idx;
+                                        last_click = Some((mx, my));
+                                    }
                                 }
                             }
                         } else {
-                            // click outside the dialog closes it
                             app.dialog = None;
                             last_click = None;
                         }
@@ -922,10 +1229,12 @@ mod tests {
                 {"name":"X","bundle_id":"x.app"}]"#,
         )
         .unwrap();
-        let dialog = app_picker(&data).unwrap();
-        assert_eq!(dialog.items.len(), 2);
-        assert!(matches!(dialog.items[1].1, Choice::Uninstall(ref b) if b == "x.app"));
-        assert!(dialog.title.contains("uninstall"));
+        let dialog = app_picker(&data, Choice::Uninstall).unwrap();
+        let DialogKind::Pick { items, .. } = dialog.kind else {
+            panic!("picker devolve DialogKind::Pick");
+        };
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[1].1, Choice::Uninstall(ref b) if b == "x.app"));
     }
 
     #[test]
@@ -967,7 +1276,7 @@ mod tests {
 
     #[test]
     fn app_picker_empty() {
-        assert!(app_picker(&json!([])).is_none());
-        assert!(app_picker(&json!(null)).is_none());
+        assert!(app_picker(&json!([]), Choice::Forget).is_none());
+        assert!(app_picker(&json!(null), Choice::Forget).is_none());
     }
 }
