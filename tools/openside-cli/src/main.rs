@@ -740,7 +740,7 @@ fn installs_view(data: &Value) -> Vec<Line<'static>> {
 
 // ---- bot: PNG original renderizado (ratatui-image, meios-blocos utf-8) ----
 const BOT_PNG: &[u8] = include_bytes!("assets/openside.png");
-const BOT_ROWS: u16 = 14;
+const BOT_ROWS: u16 = 12;
 
 /// carrega a arte, recorta ao conteúdo e pinta a margem com o fundo do app
 fn bot_protocol() -> Option<Bot> {
@@ -825,7 +825,7 @@ fn bot_protocol() -> Option<Bot> {
         .new_protocol(
             dyn_img,
             ratatui::layout::Size::new(cols, BOT_ROWS),
-            ratatui_image::Resize::Fit(Some(image::imageops::FilterType::Nearest)),
+            ratatui_image::Resize::Fit(None),
         )
         .ok()
         .map(|proto| Bot { proto, cols, rows: BOT_ROWS })
@@ -1165,11 +1165,11 @@ fn main() -> io::Result<()> {
                 }
             }
             let logo_band: [Rect; 3] =
-                Layout::vertical([Constraint::Length(4), Constraint::Length(6), Constraint::Min(0)])
+                Layout::vertical([Constraint::Length(3), Constraint::Length(6), Constraint::Min(0)])
                     .areas(header[2]);
             f.render_widget(Paragraph::new(logo_lines("openside")), logo_band[1]);
             let chips_band: [Rect; 2] =
-                Layout::vertical([Constraint::Length(6), Constraint::Length(1)]).areas(header[3]);
+                Layout::vertical([Constraint::Length(5), Constraint::Length(1)]).areas(header[3]);
             let n_devices = connected(&app.devices);
             f.render_widget(
                 Paragraph::new(Line::from(vec![
