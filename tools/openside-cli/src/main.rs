@@ -5,6 +5,7 @@
 // no typing — pick a command, pick an .ipa / an app, engine does the rest.
 
 mod logo;
+use ratatui_image::protocol::Protocol;
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
@@ -260,6 +261,7 @@ struct LoginFlow {
 }
 
 struct App {
+    bot: Option<Protocol>,
     login: Option<LoginFlow>,
     selection: usize,
     log: Vec<Line<'static>>,
@@ -302,6 +304,7 @@ fn drop_creds(path: &std::path::Path) {
 impl App {
     fn new() -> Self {
         Self {
+            bot: bot_protocol(),
             login: None,
             selection: 0,
             panel: vec![],
@@ -735,113 +738,93 @@ fn installs_view(data: &Value) -> Vec<Line<'static>> {
         .collect()
 }
 
-// ---- bot: retrato pixelart gerado da arte do usuario (janela/paleta dela) ----
-const BOT_MAP: [&str; 45] = [
-        "...................BBBB....................",
-        "................D.BBBFBBB..................",
-        "...............DDDBB.BB.BB.................",
-        "...............DkDDB....BBB................",
-        "...............BBBBB..BBBBB................",
-        ".................BB...B...BB...............",
-        ".........................BBBB..............",
-        ".............DBBB.DBBBBkkFFBB..............",
-        "...........DBBBBBDBBBBBBBkk................",
-        "..........BBBFBBFBBBBBBBBBBB...............",
-        ".........BBDBBBBBBBBBBBBBFBBB.D............",
-        ".......DDkDBBBBBBBBBBBFkBBFBBBkB...........",
-        "......DFkDBBBBBBBBBBBBBBkkFBBBBB...........",
-        ".....DBkDBBBBBBBBBBBBBBBBDkBBBFB...........",
-        ".....DFDBBDBBDBBBBBBBBBkBBDkBBFFB..........",
-        "....DBkDBDDBDBBBBBBBBBBDkBBDkFFk...........",
-        "....DFDBBDBBBBFBDBBBFBBBDBBBBFFk...........",
-        "....BkBBBBBBBBFBBBBBkBBBFkBBBkkB...........",
-        ".....DBBABBBBBFBBBBBBFBkBBFBBBk............",
-        "...BkBFBBBFBBBFFBBFBBFBkBBFFBBk..k.........",
-        "...BDBFBBBFBBBFFBBFBBkFkBFkBFBB.kB....B....",
-        "..D.BBBFBFFBBBFFBBBFFBFFkFBFBBBkB......B...",
-        "..B.BBkFBFFBBBFkFBBFFBkFSkBkFBBkB....Dk.B..",
-        ".D..BBkBkFFWBBFkFBBFkBkFSkkWFBBk.....AD.BD.",
-        ".B.B.BFFkBFWBBFSFBBkFBkkSSSSkBFBkk..BFD..B.",
-        "D..B.BFBWBFSkkFFSkFFkMkSSSSSkBFBSSk.BFD...B",
-        "D..B.kFkkkkkSkkkSkSLFWSSSSkSkBBBSRS.BFBD..B",
-        "...B.kB.WSSSkkSSSSSkWWkkkkkSkBBBkSS.BkBD...",
-        "...B..B.WSSSSSWWSSSSSkhMkwkUkBBkWSS.BFBB...",
-        "...B.......UkkkWSSSSSwwwMSSSkBBBWSk..k.B...",
-        "...B.....WwwwIwSSISMSSSSSSSVkBkBWSk..B.BB..",
-        "...B....WkSSSSSSUSSVISSSSSSkkFB.Sk...k.BB..",
-        ".....B..MWSSSSSSWSSSvvvvvSSSkB.......B..BD.",
-        ".........v.vMSkSWSSSSSSSSSSSkB...Bk.....BB.",
-        "...B.......SISSSWSSSSSSSSSSSB.....k.B....B.",
-        "...........SSSSSSSSISSSSSSSSB.....B.B....BD",
-        "............SSSSSSSSSSSSUSS........kBB....B",
-        ".............SSSSSSSSwwhSSS......k...B.....",
-        ".............SSSSkhwwwwSSSSW........kB....B",
-        "..............SSSSSwSSSSSSWXX.......BBB....",
-        "................SSSSSSSSSSRW.........BB....",
-        ".................SSSSSSSkRW........k..AB...",
-        "..................SSSSSkRX............BB...",
-        "...................SSSkRX..............B...",
-        "......................R....................",
-];
+// ---- bot: PNG original renderizado (ratatui-image, meios-blocos utf-8) ----
+const BOT_PNG: &[u8] = include_bytes!("assets/openside.png");
+const BOT_COLS: u16 = 45;
+const BOT_ROWS: u16 = 24;
 
-// paleta completa da personagem, um char por hex
-const BOT_PAL: [(char, Color); 19] = [
-    ('A', Color::Rgb(0x02, 0x6D, 0x4F)), // verde principal
-    ('B', Color::Rgb(0x02, 0x61, 0x48)), // verde escuro
-    ('C', Color::Rgb(0x04, 0x47, 0x38)), // sombras
-    ('D', Color::Rgb(0x64, 0xE0, 0xA4)), // reflexos claros
-    ('E', Color::Rgb(0x24, 0xA0, 0x67)), // reflexos medios
-    ('F', Color::Rgb(0x01, 0x2D, 0x2D)), // contorno
-    ('S', Color::Rgb(0xFD, 0xD8, 0xBC)), // pele base
-    ('L', Color::Rgb(0xED, 0xB8, 0x9C)), // pele luz
-    ('W', Color::Rgb(0xED, 0x87, 0x68)), // pele sombra quente
-    ('X', Color::Rgb(0xDF, 0x73, 0x59)), // pele sombra profunda
-    ('R', Color::Rgb(0xAE, 0x55, 0x44)), // contorno quente
-    ('V', Color::Rgb(0x84, 0x2A, 0xA9)), // roxo principal
-    ('v', Color::Rgb(0xAA, 0x4E, 0xCB)), // roxo reflexo
-    ('U', Color::Rgb(0x62, 0x17, 0x81)), // roxo sombra
-    ('h', Color::Rgb(0xBD, 0xB4, 0xDA)), // roxo brilho claro
-    ('I', Color::Rgb(0xBE, 0x9D, 0x7A)), // uris dourada
-    ('M', Color::Rgb(0x34, 0x22, 0x21)), // marrom escuro
-    ('w', Color::Rgb(0xFF, 0xFF, 0xFF)), // branco
-    ('k', Color::Rgb(0x00, 0x00, 0x00)), // preto
-];
+/// carrega a arte, recorta ao conteúdo e pinta a margem com o fundo do app
+fn bot_protocol() -> Option<Protocol> {
+    let decoded = image::ImageReader::new(std::io::Cursor::new(BOT_PNG))
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?
+        .into_rgba8();
+    let (w, h) = (decoded.width() as usize, decoded.height() as usize);
+    let px = decoded.into_raw();
 
-fn bot_tint(c: char) -> Color {
-    BOT_PAL
-        .iter()
-        .find(|(ch, _)| *ch == c)
-        .map(|(_, col)| *col)
-        .unwrap_or(BG)
-}
+    let lum = |x: usize, y: usize| -> u32 {
+        let i = (y * w + x) * 4;
+        (u32::from(px[i]) + u32::from(px[i + 1]) + u32::from(px[i + 2])) / 3
+    };
+    let dark = |x: usize, y: usize| lum(x, y) < 215;
+    let empty_col = |x: usize| (0..h).all(|y| !dark(x, y));
+    let empty_row = |y: usize| (0..w).all(|x| !dark(x, y));
+    let x0 = (0..w).take_while(|&x| empty_col(x)).count();
+    let x1 = w - (0..w).rev().take_while(|&x| empty_col(x)).count();
+    let y0 = (0..h).take_while(|&y| empty_row(y)).count();
+    let y1 = h - (0..h).rev().take_while(|&y| empty_row(y)).count();
+    let cw = x1.saturating_sub(x0).max(1);
+    let ch = y1.saturating_sub(y0).max(1);
 
-/// 24 px de altura → 12 linhas de terminal (meios-blocos)
-fn bot_lines() -> Vec<Line<'static>> {
-    let width = BOT_MAP[0].len();
-    let empty = ".".repeat(width);
-    (0..BOT_MAP.len().div_ceil(2))
-        .map(|pair| {
-            let top = BOT_MAP[pair * 2];
-            let bot = BOT_MAP.get(pair * 2 + 1).copied().unwrap_or(empty.as_str());
-            let mut spans = Vec::with_capacity(width);
-            for (t, b) in top.chars().zip(bot.chars()) {
-                if t == '.' && b == '.' {
-                    spans.push(Span::styled(" ", st(BG)));
-                } else {
-                    spans.push(Span::styled(
-                        "▀",
-                        Style::new()
-                            .fg(bot_tint(t))
-                            .bg(if b == '.' { BG } else { bot_tint(b) }),
-                    ));
-                }
+    let mut cropped = Vec::with_capacity(cw * ch * 4);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let i = (y * w + x) * 4;
+            cropped.extend_from_slice(&px[i..i + 4]);
+        }
+    }
+
+    // margem branco-neve conetada à borda vira o fundo do app
+    fn near_white(px: &[u8], seen: &[bool], c: usize) -> bool {
+        !seen[c] && px[c * 4] > 215 && px[c * 4 + 1] > 215 && px[c * 4 + 2] > 215
+    }
+    let bg = [0x01, 0x2D, 0x2D, 255];
+    let mut flood = std::collections::VecDeque::new();
+    let mut seen = vec![false; cw * ch];
+    for x in 0..cw {
+        let c = x;
+        if near_white(&cropped, &seen, c) { seen[c] = true; flood.push_back((x, 0)); }
+        let c2 = (ch - 1) * cw + x;
+        if near_white(&cropped, &seen, c2) { seen[c2] = true; flood.push_back((x, ch - 1)); }
+    }
+    for y in 0..ch {
+        let c = y * cw;
+        if near_white(&cropped, &seen, c) { seen[c] = true; flood.push_back((0, y)); }
+        let c2 = y * cw + cw - 1;
+        if near_white(&cropped, &seen, c2) { seen[c2] = true; flood.push_back((cw - 1, y)); }
+    }
+    while let Some((x, y)) = flood.pop_front() {
+        let c = y * cw + x;
+        cropped[c * 4..c * 4 + 4].copy_from_slice(&bg);
+        for (nx, ny) in [
+            (x.saturating_sub(1), y),
+            ((x + 1).min(cw - 1), y),
+            (x, y.saturating_sub(1)),
+            (x, (y + 1).min(ch - 1)),
+        ] {
+            let nc = ny * cw + nx;
+            if near_white(&cropped, &seen, nc) {
+                seen[nc] = true;
+                flood.push_back((nx, ny));
             }
-            Line::from(spans)
-        })
-        .collect()
+        }
+    }
+
+    let dyn_img =
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_raw(cw as u32, ch as u32, cropped)?);
+    let picker = ratatui_image::picker::Picker::halfblocks();
+    picker
+        .new_protocol(
+            dyn_img,
+            ratatui::layout::Size::new(BOT_COLS, BOT_ROWS),
+            ratatui_image::Resize::Fit(None),
+        )
+        .ok()
 }
 
-// ---- header logo, half-block rendering ----
+// ---- header logo, half-block rendering ----// ---- header logo, half-block rendering ----
 /// line-by-line gradient: rgb lerp between stops over the 12 pixel rows
 fn mix(a: Color, b: Color, t: f32) -> Color {
     let (r1, g1, b1) = match a {
@@ -1145,20 +1128,27 @@ fn main() -> io::Result<()> {
             f.render_widget(Block::default().style(Style::new().bg(BG)), area);
 
             let rows = Layout::vertical([
-                Constraint::Length(24),
+                Constraint::Length(BOT_ROWS),
                 Constraint::Length(1),
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
             .split(area);
             let header = Layout::horizontal([
-                Constraint::Length(BOT_MAP[0].len() as u16),
+                Constraint::Length(BOT_COLS + 1),
                 Constraint::Length(2),
                 Constraint::Length(57),
                 Constraint::Min(0),
             ])
             .split(rows[0]);
-            f.render_widget(Paragraph::new(bot_lines()), header[0]);
+            if let Some(bot) = &app.bot {
+                if rows[0].height >= BOT_ROWS {
+                    f.render_widget(
+                        ratatui_image::Image::new(bot).allow_clipping(true),
+                        header[0],
+                    );
+                }
+            }
             let logo_band: [Rect; 3] =
                 Layout::vertical([Constraint::Length(9), Constraint::Length(6), Constraint::Min(0)])
                     .areas(header[2]);
@@ -1470,12 +1460,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bot_grid_is_rect_and_six_rows() {
-        let lines = bot_lines();
-        assert_eq!(lines.len(), BOT_MAP.len().div_ceil(2)); // 2 px por linha
-        for line in &lines {
-            assert_eq!(line.spans.len(), BOT_MAP[0].len());
-        }
+    fn bot_protocol_builds_fast() {
+        let t = std::time::Instant::now();
+        let proto = bot_protocol();
+        assert!(proto.is_some(), "protocol should build");
+        assert!(t.elapsed() < std::time::Duration::from_secs(3), "demora demais: {t:?}");
     }
 
     #[test]
