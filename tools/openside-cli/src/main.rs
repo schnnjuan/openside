@@ -790,17 +790,47 @@ fn maki_lines() -> Vec<Line<'static>> {
 }
 
 // ---- header logo, half-block rendering ----
+/// line-by-line gradient: rgb lerp between stops over the 12 pixel rows
+fn mix(a: Color, b: Color, t: f32) -> Color {
+    let (r1, g1, b1) = match a {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => (0, 0, 0),
+    };
+    let (r2, g2, b2) = match b {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => (0, 0, 0),
+    };
+    let t = t.clamp(0.0, 1.0);
+    Color::Rgb(
+        (r1 as f32 + (r2 as f32 - r1 as f32) * t) as u8,
+        (g1 as f32 + (g2 as f32 - g1 as f32) * t) as u8,
+        (b1 as f32 + (b2 as f32 - b1 as f32) * t) as u8,
+    )
+}
+
+/// gradient color of the pixel row: CY → MAG → GRN piecewise
+fn row_fade(row: usize, rows: usize) -> Color {
+    let span = (rows - 1).max(1) as f32;
+    let mid = span / 2.0;
+    if row as f32 <= mid {
+        mix(CY, MAG, row as f32 / mid)
+    } else {
+        mix(MAG, GRN, (row as f32 - mid) / (span - mid))
+    }
+}
+
 fn logo_lines(word: &str) -> Vec<Line<'static>> {
     let g = logo::grid(word);
-    let ramp = [CY, CY, MAG, MAG, GRN, GRN];
-    (0..g.len().div_ceil(2))
+    let total = g.len();
+    (0..total.div_ceil(2))
         .map(|pair| {
             let top_row = &g[pair * 2];
             let bot_row: Vec<bool> = g
                 .get(pair * 2 + 1)
                 .cloned()
                 .unwrap_or_else(|| vec![false; top_row.len()]);
-            let color = ramp[pair.min(ramp.len() - 1)];
+            let top_color = row_fade(pair * 2, total);
+            let bot_color = row_fade(pair * 2 + 1, total);
             let mut spans = Vec::with_capacity(top_row.len());
             for (top, bottom) in top_row.iter().zip(bot_row.iter()) {
                 if !top && !bottom {
@@ -809,8 +839,8 @@ fn logo_lines(word: &str) -> Vec<Line<'static>> {
                     spans.push(Span::styled(
                         "▀",
                         Style::new()
-                            .fg(if *top { color } else { BG })
-                            .bg(if *bottom { color } else { BG }),
+                            .fg(if *top { top_color } else { BG })
+                            .bg(if *bottom { bot_color } else { BG }),
                     ));
                 }
             }
@@ -1380,6 +1410,20 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logo_gradient_line_by_line() {
+        // first row starts at CY, last row ends at GRN, mid drifts to MAG
+        assert_eq!(row_fade(0, 12), CY);
+        let last = row_fade(11, 12);
+        assert_eq!(last, GRN, "última linha chega no verde, got {last:?}");
+        let mid = row_fade(6, 12);
+        let (r, _, b) = match mid {
+            Color::Rgb(r, g, b) => (r, g, b),
+            _ => (0, 0, 0),
+        };
+        assert!(r > 90 && r < 180 && b > 180, "meio tende ao violeta: {mid:?}");
+    }
 
     #[test]
     fn maki_grid_dims_and_halfblock_rows() {
