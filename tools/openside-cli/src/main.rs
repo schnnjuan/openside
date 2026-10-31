@@ -261,7 +261,7 @@ struct LoginFlow {
 }
 
 struct App {
-    bot: Option<Protocol>,
+    bot: Option<Bot>,
     login: Option<LoginFlow>,
     selection: usize,
     log: Vec<Line<'static>>,
@@ -740,11 +740,10 @@ fn installs_view(data: &Value) -> Vec<Line<'static>> {
 
 // ---- bot: PNG original renderizado (ratatui-image, meios-blocos utf-8) ----
 const BOT_PNG: &[u8] = include_bytes!("assets/openside.png");
-const BOT_COLS: u16 = 45;
-const BOT_ROWS: u16 = 24;
+const BOT_ROWS: u16 = 14;
 
 /// carrega a arte, recorta ao conteúdo e pinta a margem com o fundo do app
-fn bot_protocol() -> Option<Protocol> {
+fn bot_protocol() -> Option<Bot> {
     let decoded = image::ImageReader::new(std::io::Cursor::new(BOT_PNG))
         .with_guessed_format()
         .ok()?
@@ -814,14 +813,30 @@ fn bot_protocol() -> Option<Protocol> {
 
     let dyn_img =
         image::DynamicImage::ImageRgba8(image::RgbaImage::from_raw(cw as u32, ch as u32, cropped)?);
+    // from_query_stdio reads stdin waiting for terminal replies — it eats
+    // keys in ptys without a responder; halfblocks is the safe default
+    // (crispness comes from the Nearest filter below)
     let picker = ratatui_image::picker::Picker::halfblocks();
+    let fs = picker.font_size();
+    let cols = ((BOT_ROWS as f32 * fs.height as f32 * cw as f32)
+        / (fs.width as f32 * ch as f32))
+        .ceil() as u16;
     picker
         .new_protocol(
             dyn_img,
-            ratatui::layout::Size::new(BOT_COLS, BOT_ROWS),
-            ratatui_image::Resize::Fit(None),
+            ratatui::layout::Size::new(cols, BOT_ROWS),
+            ratatui_image::Resize::Fit(Some(image::imageops::FilterType::Nearest)),
         )
         .ok()
+        .map(|proto| Bot { proto, cols, rows: BOT_ROWS })
+}
+
+/// protocol + layout dimensions discovered at load
+struct Bot {
+    proto: Protocol,
+    cols: u16,
+    #[allow(dead_code)]
+    rows: u16,
 }
 
 // ---- header logo, half-block rendering ----// ---- header logo, half-block rendering ----
@@ -1135,26 +1150,26 @@ fn main() -> io::Result<()> {
             ])
             .split(area);
             let header = Layout::horizontal([
-                Constraint::Length(BOT_COLS + 1),
+                Constraint::Length(app.bot.as_ref().map_or(1, |b| b.cols + 1)),
                 Constraint::Length(2),
                 Constraint::Length(57),
                 Constraint::Min(0),
             ])
             .split(rows[0]);
             if let Some(bot) = &app.bot {
-                if rows[0].height >= BOT_ROWS {
+                if rows[0].height >= bot.rows.max(1) {
                     f.render_widget(
-                        ratatui_image::Image::new(bot).allow_clipping(true),
+                        ratatui_image::Image::new(&bot.proto).allow_clipping(true),
                         header[0],
                     );
                 }
             }
             let logo_band: [Rect; 3] =
-                Layout::vertical([Constraint::Length(9), Constraint::Length(6), Constraint::Min(0)])
+                Layout::vertical([Constraint::Length(4), Constraint::Length(6), Constraint::Min(0)])
                     .areas(header[2]);
             f.render_widget(Paragraph::new(logo_lines("openside")), logo_band[1]);
             let chips_band: [Rect; 2] =
-                Layout::vertical([Constraint::Length(12), Constraint::Length(1)]).areas(header[3]);
+                Layout::vertical([Constraint::Length(6), Constraint::Length(1)]).areas(header[3]);
             let n_devices = connected(&app.devices);
             f.render_widget(
                 Paragraph::new(Line::from(vec![
