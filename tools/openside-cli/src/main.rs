@@ -736,31 +736,52 @@ fn installs_view(data: &Value) -> Vec<Line<'static>> {
 }
 
 // ---- bot: retrato pixelart gerado da arte do usuario (janela/paleta dela) ----
-const BOT_MAP: [&str; 24] = [
-        "kkkkkkkkkkBkkkkkkkkkkk",
-        "kkkkkkkkDBBBBkkkkkkkkk",
-        "kkkkkkkkFBFFBBkkkkkkkk",
-        "kkkkkkkkkBFFFBkkkkkkkk",
-        "kkkkkkkBBBBBkFFkkkkkkk",
-        "kkkkkBBBBBBBBBBkkkkkkk",
-        "kkkkEBBBBBBBBFBBkkkkkk",
-        "kkkBDBBBBBBBBDBFFkkkkk",
-        "kkkFBBBBBBBBFBBFFFkkkk",
-        "kkkBBBBFBBBBBBBFFFkkkk",
-        "kkkBBBBFBBBFFBBBFFFkkk",
-        "kkBBBFBFFBBFkkBBFFkFkk",
-        "kkBBBFkFFBFFkSkBFFBkBk",
-        "kkFFkFSFSFMSSSBBSkFDkk",
-        "kkFFWSSSSSWkkMUBWkBBkk",
-        "kkFFkkkMSUSSSSBBWFFBkk",
-        "kkkFUSSSMSSSSvFBkFFFBk",
-        "kkkFkkvSSSSISSBkFFFkBk",
-        "kkkkkkSSSSSSSSkkFFBkFk",
-        "kkkkFkkSSSwwISkkFFBkkk",
-        "kkkkkkkkSSSSSXkkkFFkkk",
-        "kkkkkkkkkSSSRkkkkkFBkk",
-        "kkkkkkkkkkkRkkkkkkkFFk",
-        "kkkkkkkkkkkkkkkkkkkkkk",
+const BOT_MAP: [&str; 45] = [
+        "...................BBBB....................",
+        "................D.BBBFBBB..................",
+        "...............DDDBB.BB.BB.................",
+        "...............DkDDB....BBB................",
+        "...............BBBBB..BBBBB................",
+        ".................BB...B...BB...............",
+        ".........................BBBB..............",
+        ".............DBBB.DBBBBkkFFBB..............",
+        "...........DBBBBBDBBBBBBBkk................",
+        "..........BBBFBBFBBBBBBBBBBB...............",
+        ".........BBDBBBBBBBBBBBBBFBBB.D............",
+        ".......DDkDBBBBBBBBBBBFkBBFBBBkB...........",
+        "......DFkDBBBBBBBBBBBBBBkkFBBBBB...........",
+        ".....DBkDBBBBBBBBBBBBBBBBDkBBBFB...........",
+        ".....DFDBBDBBDBBBBBBBBBkBBDkBBFFB..........",
+        "....DBkDBDDBDBBBBBBBBBBDkBBDkFFk...........",
+        "....DFDBBDBBBBFBDBBBFBBBDBBBBFFk...........",
+        "....BkBBBBBBBBFBBBBBkBBBFkBBBkkB...........",
+        ".....DBBABBBBBFBBBBBBFBkBBFBBBk............",
+        "...BkBFBBBFBBBFFBBFBBFBkBBFFBBk..k.........",
+        "...BDBFBBBFBBBFFBBFBBkFkBFkBFBB.kB....B....",
+        "..D.BBBFBFFBBBFFBBBFFBFFkFBFBBBkB......B...",
+        "..B.BBkFBFFBBBFkFBBFFBkFSkBkFBBkB....Dk.B..",
+        ".D..BBkBkFFWBBFkFBBFkBkFSkkWFBBk.....AD.BD.",
+        ".B.B.BFFkBFWBBFSFBBkFBkkSSSSkBFBkk..BFD..B.",
+        "D..B.BFBWBFSkkFFSkFFkMkSSSSSkBFBSSk.BFD...B",
+        "D..B.kFkkkkkSkkkSkSLFWSSSSkSkBBBSRS.BFBD..B",
+        "...B.kB.WSSSkkSSSSSkWWkkkkkSkBBBkSS.BkBD...",
+        "...B..B.WSSSSSWWSSSSSkhMkwkUkBBkWSS.BFBB...",
+        "...B.......UkkkWSSSSSwwwMSSSkBBBWSk..k.B...",
+        "...B.....WwwwIwSSISMSSSSSSSVkBkBWSk..B.BB..",
+        "...B....WkSSSSSSUSSVISSSSSSkkFB.Sk...k.BB..",
+        ".....B..MWSSSSSSWSSSvvvvvSSSkB.......B..BD.",
+        ".........v.vMSkSWSSSSSSSSSSSkB...Bk.....BB.",
+        "...B.......SISSSWSSSSSSSSSSSB.....k.B....B.",
+        "...........SSSSSSSSISSSSSSSSB.....B.B....BD",
+        "............SSSSSSSSSSSSUSS........kBB....B",
+        ".............SSSSSSSSwwhSSS......k...B.....",
+        ".............SSSSkhwwwwSSSSW........kB....B",
+        "..............SSSSSwSSSSSSWXX.......BBB....",
+        "................SSSSSSSSSSRW.........BB....",
+        ".................SSSSSSSkRW........k..AB...",
+        "..................SSSSSkRX............BB...",
+        "...................SSSkRX..............B...",
+        "......................R....................",
 ];
 
 // paleta completa da personagem, um char por hex
@@ -1124,7 +1145,7 @@ fn main() -> io::Result<()> {
             f.render_widget(Block::default().style(Style::new().bg(BG)), area);
 
             let rows = Layout::vertical([
-                Constraint::Length(12),
+                Constraint::Length(24),
                 Constraint::Length(1),
                 Constraint::Min(0),
                 Constraint::Length(1),
@@ -1139,11 +1160,11 @@ fn main() -> io::Result<()> {
             .split(rows[0]);
             f.render_widget(Paragraph::new(bot_lines()), header[0]);
             let logo_band: [Rect; 3] =
-                Layout::vertical([Constraint::Length(3), Constraint::Length(6), Constraint::Min(1)])
+                Layout::vertical([Constraint::Length(9), Constraint::Length(6), Constraint::Min(0)])
                     .areas(header[2]);
             f.render_widget(Paragraph::new(logo_lines("openside")), logo_band[1]);
             let chips_band: [Rect; 2] =
-                Layout::vertical([Constraint::Length(6), Constraint::Length(1)]).areas(header[3]);
+                Layout::vertical([Constraint::Length(12), Constraint::Length(1)]).areas(header[3]);
             let n_devices = connected(&app.devices);
             f.render_widget(
                 Paragraph::new(Line::from(vec![
@@ -1451,7 +1472,7 @@ mod tests {
     #[test]
     fn bot_grid_is_rect_and_six_rows() {
         let lines = bot_lines();
-        assert_eq!(lines.len(), 12); // 24 px → 12 terminal rows
+        assert_eq!(lines.len(), BOT_MAP.len().div_ceil(2)); // 2 px por linha
         for line in &lines {
             assert_eq!(line.spans.len(), BOT_MAP[0].len());
         }
