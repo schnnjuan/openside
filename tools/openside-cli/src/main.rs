@@ -737,32 +737,23 @@ fn installs_view(data: &Value) -> Vec<Line<'static>> {
 
 // ---- header logo, half-block rendering ----
 /// line-by-line gradient: rgb lerp between stops over the 12 pixel rows
-fn mix(a: Color, b: Color, t: f32) -> Color {
-    let (r1, g1, b1) = match a {
-        Color::Rgb(r, g, b) => (r, g, b),
-        _ => (0, 0, 0),
-    };
-    let (r2, g2, b2) = match b {
-        Color::Rgb(r, g, b) => (r, g, b),
-        _ => (0, 0, 0),
-    };
-    let t = t.clamp(0.0, 1.0);
-    Color::Rgb(
-        (r1 as f32 + (r2 as f32 - r1 as f32) * t) as u8,
-        (g1 as f32 + (g2 as f32 - g1 as f32) * t) as u8,
-        (b1 as f32 + (b2 as f32 - b1 as f32) * t) as u8,
-    )
-}
+/// light→dark green tones of the theme: the fade runs over several stops
+/// so the transition appears smooth without muddying
+const FADE_STOPS: [(u8, u8, u8); 3] =
+    [(0x64, 0xE0, 0xA4), (0x24, 0xA0, 0x67), (0x02, 0x61, 0x48)];
 
-/// gradient color of the pixel row: CY → MAG → GRN piecewise
+/// gradient color of the pixel row: light green (top) → dark green (bottom)
 fn row_fade(row: usize, rows: usize) -> Color {
-    let span = (rows - 1).max(1) as f32;
-    let mid = span / 2.0;
-    if row as f32 <= mid {
-        mix(CY, MAG, row as f32 / mid)
-    } else {
-        mix(MAG, GRN, (row as f32 - mid) / (span - mid))
-    }
+    let span = rows.saturating_sub(1).max(1) as f32;
+    let u = (row as f32 / span) * (FADE_STOPS.len() - 1) as f32;
+    let i = (u as usize).min(FADE_STOPS.len() - 2);
+    let t = (u - i as f32).clamp(0.0, 1.0);
+    let (a, b) = (FADE_STOPS[i], FADE_STOPS[i + 1]);
+    Color::Rgb(
+        (f32::from(a.0) + (f32::from(b.0) - f32::from(a.0)) * t) as u8,
+        (f32::from(a.1) + (f32::from(b.1) - f32::from(a.1)) * t) as u8,
+        (f32::from(a.2) + (f32::from(b.2) - f32::from(a.2)) * t) as u8,
+    )
 }
 
 fn logo_lines(word: &str) -> Vec<Line<'static>> {
@@ -1039,27 +1030,21 @@ fn main() -> io::Result<()> {
             f.render_widget(Block::default().style(Style::new().bg(BG)), area);
 
             let rows = Layout::vertical([
-                Constraint::Length(8),
+                Constraint::Length(6),
                 Constraint::Length(1),
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
             .split(area);
-            let header = Layout::horizontal([
-                Constraint::Length(57),
-                Constraint::Min(0),
-            ])
-            .split(rows[0]);
-            let logo_band: [Rect; 3] =
-                Layout::vertical([Constraint::Length(1), Constraint::Length(6), Constraint::Min(1)])
-                    .areas(header[0]);
-            f.render_widget(Paragraph::new(logo_lines("openside")), logo_band[1]);
+            let header = Layout::horizontal([Constraint::Length(46), Constraint::Min(0)])
+                .split(rows[0]);
+            f.render_widget(Paragraph::new(logo_lines("openside")), header[0]);
             let chips_band: [Rect; 2] =
                 Layout::vertical([Constraint::Length(5), Constraint::Length(1)]).areas(header[1]);
             let n_devices = connected(&app.devices);
             f.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled("fix-it style sideloader · v0.1.0  ", st(GRAY)),
+                    Span::styled("v0.1.0  ", st(GRAY)),
                     Span::styled(" anx set ", Style::new().fg(DARK).bg(GRAY)),
                     Span::raw(" "),
                     Span::styled(format!(" engine {} ", ENGINE_VERSION.get().map(String::as_str).unwrap_or("…")), Style::new().fg(BG).bg(CY)),
@@ -1362,16 +1347,17 @@ mod tests {
 
     #[test]
     fn logo_gradient_line_by_line() {
-        // first row starts at CY, last row ends at GRN, mid drifts to MAG
-        assert_eq!(row_fade(0, 12), CY);
+        // first row = light green top, last row = dark green bottom, no violet
+        assert_eq!(row_fade(0, 12), GRN);
         let last = row_fade(11, 12);
-        assert_eq!(last, GRN, "última linha chega no verde, got {last:?}");
-        let mid = row_fade(6, 12);
-        let (r, _, b) = match mid {
+        assert_eq!(last, Color::Rgb(0x02, 0x61, 0x48), "última linha chega no verde escuro, got {last:?}");
+        let (a, m, b) = match row_fade(6, 12) {
             Color::Rgb(r, g, b) => (r, g, b),
             _ => (0, 0, 0),
         };
-        assert!(r > 130 && r < 200 && b > 170, "meio tende ao violeta: {mid:?}");
+        // mid entia: verde médio do tema (canal G domina, sem violeta)
+        assert!(m > a && m > b, "meio é verde: {a} {m} {b}");
+        assert!(a < 100 && b < 110, "meio não tem violeta nem vermelho");
     }
 
     #[test]
