@@ -740,7 +740,7 @@ fn installs_view(data: &Value) -> Vec<Line<'static>> {
 
 // ---- bot: PNG original renderizado (ratatui-image, meios-blocos utf-8) ----
 const BOT_PNG: &[u8] = include_bytes!("assets/openside.png");
-const BOT_ROWS: u16 = 12;
+const BOT_ROWS: u16 = 24; // abaixo disso a arte (110x118 nativos) vira papa
 
 /// carrega a arte: compõe o alpha sobre o fundo do app (o halfblocks
 /// compõe alpha como preto) e coloca cada pixel da arte em px inteiros
@@ -770,14 +770,14 @@ fn bot_protocol() -> Option<Bot> {
 
     let picker = ratatui_image::picker::Picker::halfblocks();
     let fs = picker.font_size();
-    let (fs_w, fs_h) = (u32::from(fs.width), u32::from(fs.height));
-    let cols = ((BOT_ROWS as f32 * fs.height as f32 * canvas.width() as f32)
-        / (fs.width as f32 * canvas.height() as f32))
-        .ceil() as u16;
 
     // downscale por voto majoritário (o que fez o mapa manual ficar bom):
     // contorno/anti-aliasing ficam em minoria na célula, o bloco sólido vence —
     // point-sampling de nearest pega o contorno fora de proporção e escurece tudo
+    // o encoder do halfblocks reduz SEMPRE a Size(cols, rows*2) AMOSTRAS com
+    // Triangle — todo trabalho em resolução maior é destruído. Então vota
+    // majoritariamente DIRETO no grid de amostras: contorno/AA perdem a
+    // vota, o bloco sólido vence, e o resize final vira identidade
     const PAL: [[u8; 3]; 19] = [
         [0x02, 0x6D, 0x4F], [0x02, 0x61, 0x48], [0x04, 0x47, 0x38], [0x64, 0xE0, 0xA4],
         [0x24, 0xA0, 0x67], [0x01, 0x2D, 0x2D], [0xFD, 0xD8, 0xBC], [0xED, 0xB8, 0x9C],
@@ -785,10 +785,14 @@ fn bot_protocol() -> Option<Bot> {
         [0xAA, 0x4E, 0xCB], [0x62, 0x17, 0x81], [0xBD, 0xB4, 0xDA], [0xBE, 0x9D, 0x7A],
         [0x34, 0x22, 0x21], [0xFF, 0xFF, 0xFF], [0x00, 0x00, 0x00],
     ];
-    let (tw, th) = (u32::from(cols) * fs_w, u32::from(BOT_ROWS) * fs_h);
-    let (sw, sh) = (canvas.width() as usize, canvas.height() as usize);
-    let mut votes = vec![0u32; (tw as usize) * (th as usize) * PAL.len()];
-    let stride = (((sw as u32 / tw) / 3).max(1), ((sh as u32 / th) / 3).max(1));
+    let cols = ((BOT_ROWS as f32 * fs.height as f32 * canvas.width() as f32)
+        / (fs.width as f32 * canvas.height() as f32))
+        .floor()
+        .max(1.0) as u16;
+    let (tw, th) = (u32::from(cols), u32::from(BOT_ROWS) * 2);
+    let (sw, sh) = (canvas.width(), canvas.height());
+    let mut votes = vec![0u32; (tw * th) as usize * PAL.len()];
+    let stride = (((sw / tw) / 3).max(1), ((sh / th) / 3).max(1));
     for (sx, sy, pxzi) in canvas.enumerate_pixels() {
         let (r, g, b) = (pxzi.0[0], pxzi.0[1], pxzi.0[2]);
         if sx % stride.0 != 0 || sy % stride.1 != 0 {
@@ -805,8 +809,8 @@ fn bot_protocol() -> Option<Bot> {
                 label = idx;
             }
         }
-        let tx = (sx * tw / sw as u32).min(tw - 1);
-        let ty = (sy * th / sh as u32).min(th - 1);
+        let tx = (sx * tw / sw).min(tw - 1);
+        let ty = (sy * th / sh).min(th - 1);
         votes[((ty * tw + tx) as usize) * PAL.len() + label] += 1;
     }
     let mut target = image::RgbaImage::new(tw, th);
@@ -1164,11 +1168,11 @@ fn main() -> io::Result<()> {
                 }
             }
             let logo_band: [Rect; 3] =
-                Layout::vertical([Constraint::Length(3), Constraint::Length(6), Constraint::Min(0)])
+                Layout::vertical([Constraint::Length(9), Constraint::Length(6), Constraint::Min(0)])
                     .areas(header[2]);
             f.render_widget(Paragraph::new(logo_lines("openside")), logo_band[1]);
             let chips_band: [Rect; 2] =
-                Layout::vertical([Constraint::Length(5), Constraint::Length(1)]).areas(header[3]);
+                Layout::vertical([Constraint::Length(12), Constraint::Length(1)]).areas(header[3]);
             let n_devices = connected(&app.devices);
             f.render_widget(
                 Paragraph::new(Line::from(vec![
