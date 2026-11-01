@@ -616,9 +616,13 @@ fn kv_view(data: &Value) -> Vec<Line<'static>> {
                 Value::Bool(b) => b.to_string(),
                 other => compact(other),
             };
+            let ink = match value {
+                Value::Bool(b) => st(if *b { GRN } else { RED }),
+                _ => st(Color::White),
+            };
             Line::from(vec![
                 Span::styled(format!("{:>width$}  ", humanize(key), width = width), st(CY)),
-                Span::styled(shown, st(Color::White)),
+                Span::styled(shown, ink),
             ])
         })
         .collect()
@@ -677,17 +681,30 @@ fn doctor_view(data: &Value) -> Vec<Line<'static>> {
         st(col).add_modifier(Modifier::BOLD),
     )));
     if let Some(checks) = data.get("checks").and_then(Value::as_array) {
+        let mut counts = (0usize, 0usize, 0usize); // ok, warn, fail
         for check in checks {
             let name = check.get("name").and_then(Value::as_str).unwrap_or("?");
             let status = check.get("status").and_then(Value::as_str).unwrap_or("fail");
             let detail = check.get("detail").and_then(Value::as_str).unwrap_or("");
             let (mark, col) = status_ink(status);
+            match status {
+                "warn" => counts.1 += 1,
+                "fail" | "expired" => counts.2 += 1,
+                _ => counts.0 += 1,
+            }
             out.push(Line::from(vec![
                 Span::styled(format!("{mark} "), st(col)),
                 Span::styled(format!("{name:<22}"), st(Color::White)),
                 Span::styled(detail.to_string(), st(GRAY)),
             ]));
         }
+        out.push(Line::from(Span::styled(
+            format!(
+                "  {} ok · {} warn · {} fail",
+                counts.0, counts.1, counts.2
+            ),
+            st(GRAY),
+        )));
     }
     out
 }
@@ -727,7 +744,22 @@ fn installs_view(data: &Value) -> Vec<Line<'static>> {
             st(GRAY),
         ))];
     }
-    list.iter()
+    let mut sorted: Vec<&Value> = list.iter().collect();
+    // expiring/expired first, then by days left so the urgent ones lead
+    // urgent first: expired as -1.0, then by days left ascending
+    sorted.sort_by(|a, b| {
+        let key = |r: &Value| {
+            let expired = r.get("expired").and_then(Value::as_bool).unwrap_or(false);
+            if expired {
+                -1.0
+            } else {
+                r.get("days_left").and_then(Value::as_f64).unwrap_or(f64::INFINITY)
+            }
+        };
+        key(a).total_cmp(&key(b))
+    });
+    sorted
+        .into_iter()
         .map(|r| {
             let name = r.get("name").and_then(Value::as_str).unwrap_or("?");
             let bundle = r.get("bundle_id").and_then(Value::as_str).unwrap_or("?");
@@ -750,6 +782,17 @@ fn installs_view(data: &Value) -> Vec<Line<'static>> {
                 Span::styled(bundle.to_string(), st(GRAY)),
             ])
         })
+        .chain(std::iter::once(Line::from(Span::styled(
+            format!(
+                "  {} app{} · {} expired",
+                list.len(),
+                if list.len() == 1 { "" } else { "s" },
+                list.iter()
+                    .filter(|r| r.get("expired").and_then(Value::as_bool).unwrap_or(false))
+                    .count()
+            ),
+            st(GRAY),
+        ))))
         .collect()
 }
 
@@ -1077,22 +1120,31 @@ fn main() -> io::Result<()> {
                 None => Line::from(vec![Span::styled("● ready", st(GRN))]),
             };
             f.render_widget(Paragraph::new(state_line).style(Style::new().bg(BG)), bands[0]);
-            let mut chips = vec![Span::styled(
-                format!("{dot} {n_devices} device{plural}", dot = if n_devices > 0 { "●" } else { "○" }, plural = if n_devices == 1 { "" } else { "s" }),
-                st(if n_devices > 0 { GRN } else { GRAY }),
-            )];
+            let mut chips = vec![
+                Span::styled("v0.1.0  ", st(GRAY)),
+                Span::styled(" anx set ", Style::new().fg(DARK).bg(GRAY)),
+                Span::raw(" "),
+                Span::styled(format!(" engine {} ", ENGINE_VERSION.get().map(String::as_str).unwrap_or("…")), Style::new().fg(BG).bg(CY)),
+                Span::raw(" "),
+            ];
             if app.expired > 0 {
-                chips.push(Span::raw("  "));
-                chips.push(Span::styled(format!("! {expired} expired", expired = app.expired), st(RED)));
+                chips.push(Span::styled(
+                    format!(" ! {expired} expired ", expired = app.expired),
+                    Style::new().fg(Color::White).bg(RED),
+                ));
+                chips.push(Span::raw(" "));
             }
             if app.expiring > 0 {
-                chips.push(Span::raw("  "));
-                chips.push(Span::styled(format!("⚠ {exp} expiring", exp = app.expiring), st(YEL)));
+                chips.push(Span::styled(
+                    format!(" ⚠ {exp} expiring ", exp = app.expiring),
+                    Style::new().fg(DARK).bg(YEL),
+                ));
+                chips.push(Span::raw(" "));
             }
-            if let Some(v) = ENGINE_VERSION.get() {
-                chips.push(Span::raw("  "));
-                chips.push(Span::styled(format!("engine {v}"), st(GRAY)));
-            }
+            chips.push(Span::styled(
+                format!(" {dot} {n_devices} device{plural} ", dot = if n_devices > 0 { "●" } else { "○" }, plural = if n_devices == 1 { "" } else { "s" }),
+                Style::new().fg(BG).bg(if n_devices > 0 { GRN } else { GRAY }),
+            ));
             f.render_widget(
                 Paragraph::new(Line::from(chips))
                     .alignment(ratatui::layout::Alignment::Right)
@@ -1435,9 +1487,11 @@ mod tests {
         )
         .unwrap();
         let view = doctor_view(&d);
-        assert_eq!(view.len(), 3, "cabeçalho + 2 checks");
+        assert_eq!(view.len(), 4, "cabeçalho + 2 checks + rodapé");
         assert!(view[0].spans[0].content.contains("overall"));
         assert!(view[2].spans[0].content.contains("✗"), "check fail → ✗");
+        assert!(view[3].spans[0].content.contains("1 ok"), "rodapé conta por status");
+        assert!(view[3].spans[0].content.contains("1 fail"), "rodapé conta por status");
     }
 
     #[test]
@@ -1449,10 +1503,13 @@ mod tests {
         )
         .unwrap();
         let view = installs_view(&d);
-        assert_eq!(view.len(), 3);
-        assert!(view[1].spans[0].content.contains("expired"), "expirado → badge");
-        assert!(view[2].spans[0].content.contains("d left"), "dias → badge");
-        assert!(view[0].spans[1].content.len() <= 20, "nome cortado a 20");
+        assert_eq!(view.len(), 4, "3 apps + rodapé");
+        assert!(view[0].spans[0].content.contains("expired"), "expirado vai pro topo");
+        assert!(view[1].spans[0].content.contains("d left"), "dias crescentes após expirados");
+        assert!(view[2].spans[0].content.contains("30d left"));
+        assert!(view[2].spans[1].content.chars().count() <= 20, "nome cortado a 20");
+        assert!(view[3].spans[0].content.contains("3 apps"), "rodapé resume");
+        assert!(view[3].spans[0].content.contains("1 expired"), "rodapé conta expirados");
     }
 
     #[test]
