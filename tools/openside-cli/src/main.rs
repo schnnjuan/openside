@@ -442,8 +442,9 @@ impl App {
                 }
             }
             _ => {
-                let text = serde_json::to_string(&frame).unwrap_or_default();
-                self.note(format!("frame {text}"));
+                // raw frame is machine data: only the kind goes to the ticker
+                let kind = frame.get("type").and_then(Value::as_str).unwrap_or("?");
+                self.note(format!("frame {kind} ignorado"));
             }
         }
     }
@@ -515,7 +516,7 @@ fn ipa_candidates() -> Vec<String> {
 /// scalar ink by type: numbers amber, bools ✓/✗, nulls dim
 fn scalar_ink(value: &Value) -> Span<'static> {
     match value {
-        Value::String(s) => Span::styled(s.clone(), st(Color::White)),
+        Value::String(s) => Span::styled(tidy_value(s), st(Color::White)),
         Value::Number(n) => Span::styled(n.to_string(), st(YEL)),
         Value::Bool(b) => Span::styled(
             if *b { "✓" } else { "✗" }.to_string(),
@@ -530,7 +531,7 @@ fn render_value(value: &Value, depth: usize) -> Vec<Line<'static>> {
     match value {
         Value::String(s) => vec![Line::from(format!("{pad}{s}"))],
         Value::Number(n) => vec![Line::from(Span::styled(n.to_string(), st(YEL)))],
-        Value::Bool(b) => vec![Line::from(scalar_ink(value))],
+        Value::Bool(_) => vec![Line::from(scalar_ink(value))],
         Value::Null => vec![Line::from(Span::styled("—", st(GRAY)))],
         Value::Object(map) => map
             .iter()
@@ -594,6 +595,10 @@ fn command_view(cmd: &str, data: &Value) -> Vec<Line<'static>> {
         "login" if data.get("accounts").is_some() || data.get("authenticated").is_some() => {
             login_status_view(data)
         }
+        "anisette" => anisette_view(data),
+        "refresh" | "sideload" | "install" => refresh_view(data),
+        "sign" | "forget" | "uninstall" => op_view(data),
+        "signed" => signed_view(data),
         _ => render_value(data, 0),
     }
 }
@@ -635,6 +640,216 @@ fn bar_text(days: f64) -> (String, Color) {
     (g, if days > 7.0 { GRN } else if days > 2.0 { YEL } else { RED })
 }
 
+/// paths under $HOME show with ~, the way a human reads them
+fn tidy_path(s: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() && s.starts_with(&home) {
+        format!("~{}", &s[home.len()..])
+    } else {
+        s.to_string()
+    }
+}
+
+/// long blobs (anisette headers, hex, base64): preview only — the raw value
+/// is machine data and useless wrapped in the panel
+fn tidy_value(s: &str) -> String {
+    let t = tidy_path(s);
+    let n = t.chars().count();
+    if n > 96 {
+        format!("{}…", t.chars().take(96).collect::<String>())
+    } else if n >= 64
+        && t
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+/=_-".contains(c))
+    {
+        format!("{}… ({} chars)", t.chars().take(16).collect::<String>(), n)
+    } else {
+        t
+    }
+}
+
+/// bytes in human units
+fn mb(bytes: Option<u64>) -> String {
+    match bytes {
+        Some(b) => format!("{:.1} MB", b as f64 / (1 << 20) as f64),
+        None => "?".to_string(),
+    }
+}
+
+/// march: results of installed/no-registry operations: uninstall/forget/sign
+fn op_view(data: &Value) -> Vec<Line<'static>> {
+    // {"ok":true,"uninstalled":"b"}
+    if let Some(bundle) = data.get("uninstalled").and_then(Value::as_str) {
+        return vec![Line::from(vec![
+            Span::styled("✓ ", st(GRN)),
+            Span::styled("uninstalled  ", st(GRAY)),
+            Span::styled(bundle.to_string(), st(Color::White).add_modifier(Modifier::BOLD)),
+        ])];
+    }
+    // {"status":"signed","output":"…ipa"} (o erro cai no corpo do if fora)
+    if let Some(path) = data.get("output").and_then(Value::as_str) {
+        if data.get("status").and_then(Value::as_str) == Some("signed") {
+            return vec![Line::from(vec![
+                Span::styled("✓ ", st(GRN)),
+                Span::styled("assinado  ", st(GRAY)),
+                Span::styled(tidy_path(path), st(YEL).add_modifier(Modifier::BOLD)),
+            ])];
+        }
+    }
+    // {"ok":bool,"bundle_id":"…"} (forget)
+    if let Some(bundle) = data.get("bundle_id").and_then(Value::as_str) {
+        if data.get("ok").and_then(Value::as_bool).is_some() {
+            let ok = data.get("ok").and_then(Value::as_bool).unwrap_or(false);
+            return vec![Line::from(vec![
+                Span::styled(if ok { "✓ " } else { "✗ " }, st(if ok { GRN } else { YEL })),
+                Span::styled(
+                    if ok { "restituído do registro  " } else { "não está no registro  " },
+                    st(GRAY),
+                ),
+                Span::styled(bundle.to_string(), st(Color::White)),
+            ])];
+        }
+    }
+    render_value(data, 0)
+}
+
+/// refresh/sideload: per-app outcome + summary
+fn refresh_view(data: &Value) -> Vec<Line<'static>> {
+    let Some(list) = data.get("refreshed").and_then(Value::as_array) else {
+        return render_value(data, 0);
+    };
+    let mut out = vec![];
+    for r in list {
+        let bundle = r.get("bundle_id").and_then(Value::as_str).unwrap_or("?");
+        match r.get("status").and_then(Value::as_str) {
+            Some("installed") => out.push(Line::from(vec![
+                Span::styled("✓ ", st(GRN)),
+                Span::styled(bundle.to_string(), st(Color::White)),
+                Span::styled(
+                    match r.get("expires_at").and_then(Value::as_str) {
+                        Some(at) if !at.is_empty() => format!("  expira {at}"),
+                        _ => String::new(),
+                    },
+                    st(GRAY),
+                ),
+            ])),
+            _ => {
+                let err = r
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("falhou (sem detalhe)");
+                out.push(Line::from(vec![
+                    Span::styled("✗ ", st(RED)),
+                    Span::styled(bundle.to_string(), st(Color::White)),
+                    Span::styled(format!("  {err}"), st(GRAY)),
+                ]));
+            }
+        }
+    }
+    if let Some(n) = data.get("count").and_then(Value::as_u64) {
+        out.push(Line::from(Span::styled(format!("  {n} app(s)"), st(GRAY))));
+    }
+    if out.is_empty() {
+        return vec![Line::from(Span::styled("· nothing to refresh", st(GRAY)))];
+    }
+    out
+}
+
+/// anisette: status dict or refresh-header dict
+fn anisette_view(data: &Value) -> Vec<Line<'static>> {
+    if let Some(map) = data.as_object() {
+        // dict of header→blob (refresh): preview each value
+        if map.keys().any(|k| k.starts_with("X-")) {
+            return map
+                .iter()
+                .map(|(k, v)| {
+                    Line::from(vec![
+                        Span::styled(format!("  {k}"), st(CY)),
+                        Span::styled(
+                            format!("  {}", tidy_value(v.as_str().unwrap_or("?"))),
+                            st(GRAY),
+                        ),
+                    ])
+                })
+                .collect();
+        }
+        if let Some(available) = data.get("available") {
+            let ok = available.as_bool().unwrap_or(false);
+            let provider = data.get("provider").and_then(Value::as_str).unwrap_or("?");
+            let version = data
+                .get("package_version")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let cached = data.get("state_cached").and_then(Value::as_bool).unwrap_or(false);
+            let servers = data.get("servers").and_then(Value::as_array);
+            let mut out = vec![Line::from(vec![
+                Span::styled(if ok { "✓ " } else { "✗ " }, st(if ok { GRN } else { RED })),
+                Span::styled(
+                    if version.is_empty() {
+                        "anisette".to_string()
+                    } else {
+                        format!("anisette {version}")
+                    },
+                    st(Color::White).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  provider {provider}"),
+                    st(CY),
+                ),
+                Span::styled(
+                    if cached { "  · state em cache" } else { "  · sem state em cache" },
+                    st(GRAY),
+                ),
+            ])];
+            if let Some(list) = servers {
+                if !list.is_empty() {
+                    let names: Vec<String> = list
+                        .iter()
+                        .map(|s| s.as_str().unwrap_or("?").to_string())
+                        .collect();
+                    out.push(Line::from(Span::styled(
+                        format!("  {} server(s): {}", list.len(), names.join(", ")),
+                        st(GRAY),
+                    )));
+                }
+            }
+            return out;
+        }
+    }
+    render_value(data, 0)
+}
+
+/// signed: count/directory/files with human sizes
+fn signed_view(data: &Value) -> Vec<Line<'static>> {
+    let count = data.get("count").and_then(Value::as_u64);
+    if let Some(count) = count {
+        let bytes = data.get("bytes").and_then(Value::as_u64);
+        let mut out = vec![Line::from(vec![
+            Span::styled("● ", st(CY)),
+            Span::styled(
+                format!("{count} ipa(s) · {}", mb(bytes)),
+                st(Color::White).add_modifier(Modifier::BOLD),
+            ),
+        ])];
+        if let Some(dir) = data.get("directory").and_then(Value::as_str) {
+            out.push(Line::from(Span::styled(format!("  {}", tidy_path(dir)), st(CY))));
+        }
+        if let Some(files) = data.get("files").and_then(Value::as_array) {
+            for f in files {
+                let name = f.get("name").and_then(Value::as_str).unwrap_or("?");
+                let size = f.get("bytes").and_then(Value::as_u64);
+                let modified = f.get("modified").and_then(Value::as_str).unwrap_or("");
+                out.push(Line::from(vec![
+                    Span::styled(format!("  {name}"), st(Color::White)),
+                    Span::styled(format!("  {}  {modified}", mb(size)), st(GRAY)),
+                ]));
+            }
+        }
+        return out;
+    }
+    render_value(data, 0)
+}
+
 /// aligned two-column key/value panel (device-info & friends)
 fn kv_view(data: &Value) -> Vec<Line<'static>> {
     let Some(map) = data.as_object() else {
@@ -646,25 +861,37 @@ fn kv_view(data: &Value) -> Vec<Line<'static>> {
         .max()
         .unwrap_or(0)
         .min(24);
-    map.iter()
-        .map(|(key, value)| {
-            let shown = match value {
-                Value::Null => "—".to_string(),
-                Value::Bool(b) => b.to_string(),
-                other => compact(other),
-            };
-            let ink = match value {
-                Value::Bool(b) => st(if *b { GRN } else { RED }),
-                Value::Number(_) => st(YEL),
-                Value::Null => st(GRAY),
-                _ => st(Color::White),
-            };
-            Line::from(vec![
-                Span::styled(format!("{:>width$}  ", humanize(key), width = width), st(CY)),
-                Span::styled(shown, ink),
-            ])
-        })
-        .collect()
+    let mut out: Vec<Line<'static>> = vec![];
+    for (key, value) in map {
+        let key_s = format!("{:>width$}  ", humanize(key), width = width);
+        match value {
+            // nested: indent, structured, no raw JSON string
+            Value::Object(_) | Value::Array(_) => {
+                out.push(Line::from(Span::styled(key_s.trim_end().to_string(), st(CY))));
+                out.extend(render_value(value, 1));
+            }
+            other => {
+                let shown = match other {
+                    Value::Null => "—".to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    Value::String(s) => tidy_value(s),
+                    Value::Number(n) => n.to_string(),
+                    other => compact(other),
+                };
+                let ink = match other {
+                    Value::Bool(b) => st(if *b { GRN } else { RED }),
+                    Value::Number(_) => st(YEL),
+                    Value::Null | Value::String(_) => st(if other.is_null() { GRAY } else { Color::White }),
+                    _ => st(Color::White),
+                };
+                out.push(Line::from(vec![
+                    Span::styled(key_s, st(CY)),
+                    Span::styled(shown, ink),
+                ]));
+            }
+        }
+    }
+    out
 }
 
 /// accounts/slots summary: email + team table, or the generic fall-back
@@ -1604,5 +1831,47 @@ mod tests {
     fn app_picker_empty() {
         assert!(app_picker(&json!([]), Choice::Forget).is_none());
         assert!(app_picker(&json!(null), Choice::Forget).is_none());
+    }
+
+    #[test]
+    fn refresh_and_op_views() {
+        let r = command_view("refresh", &json!({"status":"done","count":2,"refreshed":[
+            {"bundle_id":"a.b","status":"installed","expires_at":"2026-11-30"},
+            {"bundle_id":"c.d","status":"error","error":"pairing lost"}]}));
+        assert_eq!(r.len(), 3, "2 apps + rodapé");
+        assert!(r[0].spans[0].content.contains("✓"));
+        assert!(r[0].spans[2].content.contains("2026-11-30"));
+        assert!(r[1].spans[0].content.contains("✗"));
+        assert!(r[1].spans[2].content.contains("pairing lost"));
+        let u = command_view("uninstall", &json!({"ok":true,"uninstalled":"x.app"}));
+        assert!(u[0].spans[2].content.contains("x.app"));
+        let forget = command_view("forget", &json!({"ok":false,"bundle_id":"x.app"}));
+        assert!(forget[0].spans[1].content.contains("não está no registro"));
+    }
+
+    #[test]
+    fn anisette_and_signed_views() {
+        // dict de headers → preview truncado, não blob cru
+        let h = command_view("anisette", &json!({"X-Apple-I-Machine-ID":"XXXXXXXXYFYYYYYYYYYbbbbbbbbbbbbbccccccccccccdddddddddddddeeeeeeeeeeeeeeee"}));
+        assert!(h[0].spans[0].content.contains("X-Apple-I-Machine-ID"));
+        assert!(h[0].spans[1].content.contains("…"), "blob truncado");
+        assert!(h[0].spans[1].content.chars().count() < 40, "preview curto");
+        let st = command_view("anisette", &json!({"available":true,"provider":"remote","package_version":"1.1.22","state_cached":true,"servers":["svc.example.com"]}));
+        assert!(st[0].spans[1].content.contains("1.1.22"));
+        assert!(st[1].spans[0].content.contains("svc.example.com"));
+        let sg = command_view("signed", &json!({"count":2,"bytes":31457280,"directory":format!("{}/Documents/Signed", std::env::var("HOME").unwrap_or_default()),"files":[{"name":"a.ipa","bytes":31457280,"modified":"2026-11-01"}]}));
+        assert!(sg[0].spans[1].content.contains("2 ipa(s) · 30.0 MB"));
+        assert!(sg[1].spans[0].content.contains("~/Documents/Signed"), "caminho com ~");
+    }
+
+    #[test]
+    fn tidy_paths_and_blobs() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert_eq!(tidy_path(&format!("{home}/Signed/a.ipa")), "~/Signed/a.ipa");
+        let hex64: String = "a1b2c3d4".repeat(10);
+        let t = tidy_value(&hex64);
+        assert!(t.contains('…') && t.chars().count() < 40, "blob → preview, got {t}");
+        assert_eq!(tidy_value("curto"), "curto");
+        assert!(!tidy_value("caminho/normal.ipa").contains('…'), "caminho comum intacto");
     }
 }
