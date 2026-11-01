@@ -5,7 +5,6 @@
 // no typing — pick a command, pick an .ipa / an app, engine does the rest.
 
 mod logo;
-use ratatui_image::protocol::Protocol;
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
@@ -261,7 +260,6 @@ struct LoginFlow {
 }
 
 struct App {
-    bot: Option<Bot>,
     login: Option<LoginFlow>,
     selection: usize,
     log: Vec<Line<'static>>,
@@ -304,7 +302,6 @@ fn drop_creds(path: &std::path::Path) {
 impl App {
     fn new() -> Self {
         Self {
-            bot: bot_protocol(),
             login: None,
             selection: 0,
             panel: vec![],
@@ -738,111 +735,7 @@ fn installs_view(data: &Value) -> Vec<Line<'static>> {
         .collect()
 }
 
-// ---- bot: PNG original renderizado (ratatui-image, meios-blocos utf-8) ----
-const BOT_PNG: &[u8] = include_bytes!("assets/openside.png");
-const BOT_ROWS: u16 = 24; // abaixo disso a arte (110x118 nativos) vira papa
-
-/// carrega a arte: compõe o alpha sobre o fundo do app (o halfblocks
-/// compõe alpha como preto) e coloca cada pixel da arte em px inteiros
-/// do grid do terminal — o encoder do halfblocks sempre re-resiza com
-/// Triangle, então a imagem precisa chegar em no-op pra ficar nítida
-fn bot_protocol() -> Option<Bot> {
-    let img = image::load_from_memory(BOT_PNG).ok()?.into_rgba8();
-
-    // bbox do conteúdo por alpha
-    let (w, h) = (img.width() as usize, img.height() as usize);
-    let x0 = (0..w).take_while(|&x| (0..h).all(|y| img.get_pixel(x as u32, y as u32).0[3] <= 10)).count();
-    let x1 = w - (0..w).rev().take_while(|&x| (0..h).all(|y| img.get_pixel(x as u32, y as u32).0[3] <= 10)).count();
-    let y0 = (0..h).take_while(|&y| (0..w).all(|x| img.get_pixel(x as u32, y as u32).0[3] <= 10)).count();
-    let y1 = h - (0..h).rev().take_while(|&y| (0..w).all(|x| img.get_pixel(x as u32, y as u32).0[3] <= 10)).count();
-    let cropped = image::imageops::crop_imm(
-        &img,
-        x0 as u32,
-        y0 as u32,
-        (x1.saturating_sub(x0)).max(1) as u32,
-        (y1.saturating_sub(y0)).max(1) as u32,
-    )
-    .to_image();
-
-    let bg = image::Rgba([0x01, 0x2D, 0x2D, 255]);
-    let mut canvas = image::RgbaImage::from_pixel(cropped.width(), cropped.height(), bg);
-    image::imageops::overlay(&mut canvas, &cropped, 0, 0);
-
-    let picker = ratatui_image::picker::Picker::halfblocks();
-    let fs = picker.font_size();
-
-    // downscale por voto majoritário (o que fez o mapa manual ficar bom):
-    // contorno/anti-aliasing ficam em minoria na célula, o bloco sólido vence —
-    // point-sampling de nearest pega o contorno fora de proporção e escurece tudo
-    // o encoder do halfblocks reduz SEMPRE a Size(cols, rows*2) AMOSTRAS com
-    // Triangle — todo trabalho em resolução maior é destruído. Então vota
-    // majoritariamente DIRETO no grid de amostras: contorno/AA perdem a
-    // vota, o bloco sólido vence, e o resize final vira identidade
-    const PAL: [[u8; 3]; 19] = [
-        [0x02, 0x6D, 0x4F], [0x02, 0x61, 0x48], [0x04, 0x47, 0x38], [0x64, 0xE0, 0xA4],
-        [0x24, 0xA0, 0x67], [0x01, 0x2D, 0x2D], [0xFD, 0xD8, 0xBC], [0xED, 0xB8, 0x9C],
-        [0xED, 0x87, 0x68], [0xDF, 0x73, 0x59], [0xAE, 0x55, 0x44], [0x84, 0x2A, 0xA9],
-        [0xAA, 0x4E, 0xCB], [0x62, 0x17, 0x81], [0xBD, 0xB4, 0xDA], [0xBE, 0x9D, 0x7A],
-        [0x34, 0x22, 0x21], [0xFF, 0xFF, 0xFF], [0x00, 0x00, 0x00],
-    ];
-    let cols = ((BOT_ROWS as f32 * fs.height as f32 * canvas.width() as f32)
-        / (fs.width as f32 * canvas.height() as f32))
-        .floor()
-        .max(1.0) as u16;
-    let (tw, th) = (u32::from(cols), u32::from(BOT_ROWS) * 2);
-    let (sw, sh) = (canvas.width(), canvas.height());
-    let mut votes = vec![0u32; (tw * th) as usize * PAL.len()];
-    let stride = (((sw / tw) / 3).max(1), ((sh / th) / 3).max(1));
-    for (sx, sy, pxzi) in canvas.enumerate_pixels() {
-        let (r, g, b) = (pxzi.0[0], pxzi.0[1], pxzi.0[2]);
-        if sx % stride.0 != 0 || sy % stride.1 != 0 {
-            continue;
-        }
-        // rótulo mais próximo da paleta
-        let (py, pg, pb) = (i32::from(r), i32::from(g), i32::from(b));
-        let mut label = 0usize;
-        let mut bd = i32::MAX;
-        for (idx, &[pr, pq, pbk]) in PAL.iter().enumerate() {
-            let d = (py - i32::from(pr)).pow(2) + (pg - i32::from(pq)).pow(2) + (pb - i32::from(pbk)).pow(2);
-            if d < bd {
-                bd = d;
-                label = idx;
-            }
-        }
-        let tx = (sx * tw / sw).min(tw - 1);
-        let ty = (sy * th / sh).min(th - 1);
-        votes[((ty * tw + tx) as usize) * PAL.len() + label] += 1;
-    }
-    let mut target = image::RgbaImage::new(tw, th);
-    for (i, pxzi) in target.pixels_mut().enumerate() {
-        let bin = votes[i * PAL.len()..(i + 1) * PAL.len()]
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, &v)| v)
-            .map_or(0, |(ii, _)| ii);
-        let c = PAL[bin];
-        *pxzi = image::Rgba([c[0], c[1], c[2], 255]);
-    }
-
-    picker
-        .new_protocol(
-            image::DynamicImage::ImageRgba8(target),
-            ratatui::layout::Size::new(cols, BOT_ROWS),
-            ratatui_image::Resize::Fit(None),
-        )
-        .ok()
-        .map(|proto| Bot { proto, cols, rows: BOT_ROWS })
-}
-
-/// protocol + layout dimensions discovered at load
-struct Bot {
-    proto: Protocol,
-    cols: u16,
-    #[allow(dead_code)]
-    rows: u16,
-}
-
-// ---- header logo, half-block rendering ----// ---- header logo, half-block rendering ----
+// ---- header logo, half-block rendering ----
 /// line-by-line gradient: rgb lerp between stops over the 12 pixel rows
 fn mix(a: Color, b: Color, t: f32) -> Color {
     let (r1, g1, b1) = match a {
@@ -1146,33 +1039,23 @@ fn main() -> io::Result<()> {
             f.render_widget(Block::default().style(Style::new().bg(BG)), area);
 
             let rows = Layout::vertical([
-                Constraint::Length(BOT_ROWS),
+                Constraint::Length(8),
                 Constraint::Length(1),
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
             .split(area);
             let header = Layout::horizontal([
-                Constraint::Length(app.bot.as_ref().map_or(1, |b| b.cols + 1)),
-                Constraint::Length(2),
                 Constraint::Length(57),
                 Constraint::Min(0),
             ])
             .split(rows[0]);
-            if let Some(bot) = &app.bot {
-                if rows[0].height >= bot.rows.max(1) {
-                    f.render_widget(
-                        ratatui_image::Image::new(&bot.proto).allow_clipping(true),
-                        header[0],
-                    );
-                }
-            }
             let logo_band: [Rect; 3] =
-                Layout::vertical([Constraint::Length(9), Constraint::Length(6), Constraint::Min(0)])
-                    .areas(header[2]);
+                Layout::vertical([Constraint::Length(1), Constraint::Length(6), Constraint::Min(1)])
+                    .areas(header[0]);
             f.render_widget(Paragraph::new(logo_lines("openside")), logo_band[1]);
             let chips_band: [Rect; 2] =
-                Layout::vertical([Constraint::Length(12), Constraint::Length(1)]).areas(header[3]);
+                Layout::vertical([Constraint::Length(5), Constraint::Length(1)]).areas(header[1]);
             let n_devices = connected(&app.devices);
             f.render_widget(
                 Paragraph::new(Line::from(vec![
@@ -1476,14 +1359,6 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bot_protocol_builds_fast() {
-        let t = std::time::Instant::now();
-        let proto = bot_protocol();
-        assert!(proto.is_some(), "protocol should build");
-        assert!(t.elapsed() < std::time::Duration::from_secs(3), "demora demais: {t:?}");
-    }
 
     #[test]
     fn logo_gradient_line_by_line() {
