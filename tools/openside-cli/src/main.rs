@@ -370,7 +370,12 @@ impl App {
                 self.panel = if ok {
                     command_view(&self.last_cmd, data)
                 } else {
-                    render_value(err, RED)
+                    let mut out = vec![Line::from(Span::styled(
+                        "✗ erro do engine",
+                        st(RED).add_modifier(Modifier::BOLD),
+                    ))];
+                    out.extend(render_value(err, 0));
+                    out
                 };
                 // the next `installs` result after an app action feeds the picker
                 if ok && self.app_action.is_some() {
@@ -507,34 +512,58 @@ fn ipa_candidates() -> Vec<String> {
 }
 
 // ---- render a JSON value as colored terminal lines ----
-fn render_value(value: &Value, base: Color) -> Vec<Line<'static>> {
+/// scalar ink by type: numbers amber, bools ✓/✗, nulls dim
+fn scalar_ink(value: &Value) -> Span<'static> {
     match value {
-        Value::String(s) => vec![Line::from(s.clone())],
+        Value::String(s) => Span::styled(s.clone(), st(Color::White)),
+        Value::Number(n) => Span::styled(n.to_string(), st(YEL)),
+        Value::Bool(b) => Span::styled(
+            if *b { "✓" } else { "✗" }.to_string(),
+            st(if *b { GRN } else { RED }),
+        ),
+        _ => Span::styled("—", st(GRAY)),
+    }
+}
+
+fn render_value(value: &Value, depth: usize) -> Vec<Line<'static>> {
+    let pad = "  ".repeat(depth + 1);
+    match value {
+        Value::String(s) => vec![Line::from(format!("{pad}{s}"))],
         Value::Number(n) => vec![Line::from(Span::styled(n.to_string(), st(YEL)))],
-        Value::Bool(b) => vec![Line::from(Span::styled(
-            b.to_string(),
-            st(if *b { GRN } else { MAG }),
-        ))],
+        Value::Bool(b) => vec![Line::from(scalar_ink(value))],
+        Value::Null => vec![Line::from(Span::styled("—", st(GRAY)))],
         Value::Object(map) => map
             .iter()
             .flat_map(|(key, val)| {
-                let shown = match val {
-                    Value::String(s) => s.clone(),
-                    Value::Null => "—".to_string(),
-                    Value::Bool(b) => b.to_string(),
-                    other => compact(other),
-                };
-                vec![Line::from(vec![
-                    Span::styled(format!("  {}", humanize(key)), st(CY)),
-                    Span::styled(format!("   {shown}"), st(base)),
-                ])]
+                let key_s = Span::styled(format!("  {}", humanize(key)), st(CY));
+                match val {
+                    Value::Object(_) | Value::Array(_) => {
+                        let mut out = vec![Line::from(format!("  {}", humanize(key)))];
+                        out.extend(render_value(val, depth + 1));
+                        out
+                    }
+                    _ => vec![Line::from(vec![key_s, Span::raw("  "), scalar_ink(val)])],
+                }
             })
             .collect(),
         Value::Array(items) if items.is_empty() => {
             vec![Line::from(Span::styled("  · empty", st(GRAY)))]
         }
-        Value::Array(items) => items.iter().flat_map(|v| render_value(v, base)).collect(),
-        Value::Null => vec![Line::from(Span::styled("  · empty", st(GRAY)))],
+        // cada item do array em sequência; um marcador entre registros para ler como lista
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .flat_map(|(i, item)| {
+                let mut out = render_value(item, depth);
+                if i + 1 < items.len() && matches!(item, Value::Object(_)) {
+                    out.push(Line::from(Span::styled(
+                        "  ·".to_string(),
+                        st(GRAY),
+                    )));
+                }
+                out
+            })
+            .collect(),
     }
 }
 
@@ -545,27 +574,27 @@ fn command_view(cmd: &str, data: &Value) -> Vec<Line<'static>> {
         "devices" => devices_view(data),
         "installs" => installs_view(data),
         "device-info" => kv_view(data),
-        "version" => vec![
-            Line::from(Span::styled(
-                format!("tui {}", env!("CARGO_PKG_VERSION")),
-                st(MAG).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                format!(
-                    "engine {}",
-                    match data.get("version").and_then(Value::as_str) {
-                        Some(v) => v.to_string(),
-                        None => data.to_string(),
-                    }
-                ),
-                st(CY).add_modifier(Modifier::BOLD),
-            )),
-        ],
+        "version" => {
+            let engine = match data.get("version").and_then(Value::as_str) {
+                Some(v) => v.to_string(),
+                None => data.to_string(),
+            };
+            vec![
+                Line::from(Span::styled(
+                    format!(" openside v{} ", env!("CARGO_PKG_VERSION")),
+                    Style::new().fg(BG).bg(MAG).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format!(" engine {engine} "),
+                    Style::new().fg(BG).bg(CY).add_modifier(Modifier::BOLD),
+                )),
+            ]
+        }
         // accounts/slots output is a dict of account/device summaries
         "login" if data.get("accounts").is_some() || data.get("authenticated").is_some() => {
             login_status_view(data)
         }
-        _ => render_value(data, Color::White),
+        _ => render_value(data, 0),
     }
 }
 
@@ -598,10 +627,18 @@ fn compact(value: &Value) -> String {
     }
 }
 
+/// validity gauge ▰▰▰▰▱▱ against the 30-day signing window, colored
+/// by urgency of what remains
+fn bar_text(days: f64) -> (String, Color) {
+    let filled = (days * 10.0 / 30.0).round().clamp(1.0, 10.0) as usize;
+    let g = format!("{}{}", "▰".repeat(filled), "▱".repeat(10 - filled));
+    (g, if days > 7.0 { GRN } else if days > 2.0 { YEL } else { RED })
+}
+
 /// aligned two-column key/value panel (device-info & friends)
 fn kv_view(data: &Value) -> Vec<Line<'static>> {
     let Some(map) = data.as_object() else {
-        return render_value(data, Color::White);
+        return render_value(data, 0);
     };
     let width = map
         .keys()
@@ -618,6 +655,8 @@ fn kv_view(data: &Value) -> Vec<Line<'static>> {
             };
             let ink = match value {
                 Value::Bool(b) => st(if *b { GRN } else { RED }),
+                Value::Number(_) => st(YEL),
+                Value::Null => st(GRAY),
                 _ => st(Color::White),
             };
             Line::from(vec![
@@ -661,7 +700,7 @@ fn login_status_view(data: &Value) -> Vec<Line<'static>> {
         )));
         return out;
     }
-    render_value(data, Color::White)
+    render_value(data, 0)
 }
 
 fn status_ink(status: &str) -> (&'static str, Color) {
@@ -676,10 +715,13 @@ fn doctor_view(data: &Value) -> Vec<Line<'static>> {
     let mut out = vec![];
     let overall = data.get("overall").and_then(Value::as_str).unwrap_or("fail");
     let (mark, col) = status_ink(overall);
-    out.push(Line::from(Span::styled(
-        format!("{mark} overall: {overall}"),
-        st(col).add_modifier(Modifier::BOLD),
-    )));
+    out.push(Line::from(vec![Span::styled(
+        format!(" {mark} {overall} ", overall = overall.to_uppercase()),
+        Style::new()
+            .fg(if overall == "ok" { BG } else { Color::White })
+            .bg(col)
+            .add_modifier(Modifier::BOLD),
+    )]));
     if let Some(checks) = data.get("checks").and_then(Value::as_array) {
         let mut counts = (0usize, 0usize, 0usize); // ok, warn, fail
         for check in checks {
@@ -711,7 +753,7 @@ fn doctor_view(data: &Value) -> Vec<Line<'static>> {
 
 fn devices_view(data: &Value) -> Vec<Line<'static>> {
     let Some(list) = data.as_array() else {
-        return render_value(data, Color::White);
+        return render_value(data, 0);
     };
     if list.is_empty() {
         return vec![Line::from(Span::styled(
@@ -719,16 +761,19 @@ fn devices_view(data: &Value) -> Vec<Line<'static>> {
             st(GRAY),
         ))];
     }
-    list.iter()
+        list.iter()
         .map(|d| {
             let serial = d.get("serial").and_then(Value::as_str).unwrap_or("?");
             let tail = &serial[serial.len().saturating_sub(8)..];
             let conn = d.get("connection_type").and_then(Value::as_str).unwrap_or("?");
+            let is_usb = conn.eq_ignore_ascii_case("usb");
+            let label = if is_usb { "USB" } else { "WIFI" };
             let id = d.get("device_id").map(Value::to_string).unwrap_or_default();
             Line::from(vec![
-                Span::styled("● ", st(GRN)),
-                Span::styled("iPhone  ", st(Color::White).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("{conn}  …{tail}  id {id}"), st(GRAY)),
+                Span::styled("● ", st(if is_usb { GRN } else { MAG })),
+                Span::styled("iPhone", st(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" {label} "), Style::new().fg(BG).bg(if is_usb { CY } else { MAG })),
+                Span::styled(format!(" …{tail}  id {id}"), st(GRAY)),
             ])
         })
         .collect()
@@ -736,7 +781,7 @@ fn devices_view(data: &Value) -> Vec<Line<'static>> {
 
 fn installs_view(data: &Value) -> Vec<Line<'static>> {
     let Some(list) = data.as_array() else {
-        return render_value(data, Color::White);
+        return render_value(data, 0);
     };
     if list.is_empty() {
         return vec![Line::from(Span::styled(
@@ -765,22 +810,23 @@ fn installs_view(data: &Value) -> Vec<Line<'static>> {
             let bundle = r.get("bundle_id").and_then(Value::as_str).unwrap_or("?");
             let expired = r.get("expired").and_then(Value::as_bool).unwrap_or(false);
             let days = r.get("days_left").and_then(Value::as_f64);
-            let (badge, col) = if expired {
-                ("✗ expired".to_string(), RED)
-            } else if let Some(d) = days.filter(|&d| d <= 2.0) {
-                (format!("◐ {d:.0}d left"), RED)
-            } else if let Some(d) = days.filter(|&d| d <= 7.0) {
-                (format!("◐ {d:.0}d left"), YEL)
+            let (badge, col, gauge) = if expired {
+                ("✗ expired".to_string(), RED, String::new())
             } else if let Some(d) = days {
-                (format!("● {d:.0}d left"), GRN)
+                let (g, gcol) = bar_text(d);
+                (format!("{d:.0}d left"), gcol, g)
             } else {
-                ("● unknown".to_string(), GRAY)
+                ("? unknown".to_string(), GRAY, String::new())
             };
-            Line::from(vec![
-                Span::styled(format!("{badge:<11} "), st(col)),
-                Span::styled(format!("{name:<20.20}"), st(Color::White)),
-                Span::styled(bundle.to_string(), st(GRAY)),
-            ])
+            let mut spans = vec![Span::styled(" ● ", st(col))];
+            if !gauge.is_empty() {
+                spans.push(Span::styled(gauge, st(col)));
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled(badge, st(col)));
+            spans.push(Span::styled(format!("  {name:<20.20}"), st(Color::White)));
+            spans.push(Span::styled(bundle.to_string(), st(GRAY)));
+            Line::from(spans)
         })
         .chain(std::iter::once(Line::from(Span::styled(
             format!(
@@ -1091,35 +1137,36 @@ fn main() -> io::Result<()> {
             f.render_widget(Block::default().style(Style::new().bg(BG)), area);
 
             let rows = Layout::vertical([
-                Constraint::Length(6),
+                Constraint::Length(8),
                 Constraint::Length(1),
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
             .split(area);
             let header =
-                Layout::horizontal([Constraint::Length(56), Constraint::Min(0)]).split(rows[0]);
-            f.render_widget(Paragraph::new(logo_lines("openside")), header[0]);
+                Layout::horizontal([Constraint::Length(58), Constraint::Min(0)]).split(rows[0]);
+            // logo com respiro: 2 col à esquerda, centrada verticalmente na banda
+            let band: [Rect; 3] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Length(6),
+                Constraint::Length(1),
+            ])
+            .areas(header[0]);
+            let slot: [Rect; 3] = Layout::horizontal([
+                Constraint::Length(2),
+                Constraint::Length(56),
+                Constraint::Min(0),
+            ])
+            .areas(band[1]);
+            f.render_widget(Paragraph::new(logo_lines("openside")), slot[1]);
+            // badges centrados na altura do logo (sem linha de estado — o footer mostra)
             let bands: [Rect; 3] = Layout::vertical([
+                Constraint::Length(4),
                 Constraint::Length(1),
-                Constraint::Length(3),
-                Constraint::Length(1),
+                Constraint::Min(0),
             ])
             .areas(header[1]);
             let n_devices = connected(&app.devices);
-            // line state: busy with engine spinner or last command executed
-            let state_line = match &app.spinner {
-                Some(line) => Line::from(vec![
-                    Span::styled("⠿ ", st(CY)),
-                    Span::styled(line.clone(), st(YEL)),
-                ]),
-                None if !app.last_cmd.is_empty() => Line::from(vec![
-                    Span::styled("● ", st(GRN)),
-                    Span::styled(format!("{} ", app.last_cmd), st(GRAY)),
-                ]),
-                None => Line::from(vec![Span::styled("● ready", st(GRN))]),
-            };
-            f.render_widget(Paragraph::new(state_line).style(Style::new().bg(BG)), bands[0]);
             let mut chips = vec![
                 Span::styled("v0.1.0  ", st(GRAY)),
                 Span::styled(" anx set ", Style::new().fg(DARK).bg(GRAY)),
@@ -1149,7 +1196,7 @@ fn main() -> io::Result<()> {
                 Paragraph::new(Line::from(chips))
                     .alignment(ratatui::layout::Alignment::Right)
                     .style(Style::new().bg(BG)),
-                bands[2],
+                bands[1],
             );
 
             let body = Layout::horizontal([Constraint::Length(32), Constraint::Min(0)])
@@ -1488,7 +1535,7 @@ mod tests {
         .unwrap();
         let view = doctor_view(&d);
         assert_eq!(view.len(), 4, "cabeçalho + 2 checks + rodapé");
-        assert!(view[0].spans[0].content.contains("overall"));
+        assert!(view[0].spans[0].content.contains("OK"), "badge de saúde");
         assert!(view[2].spans[0].content.contains("✗"), "check fail → ✗");
         assert!(view[3].spans[0].content.contains("1 ok"), "rodapé conta por status");
         assert!(view[3].spans[0].content.contains("1 fail"), "rodapé conta por status");
@@ -1504,10 +1551,11 @@ mod tests {
         .unwrap();
         let view = installs_view(&d);
         assert_eq!(view.len(), 4, "3 apps + rodapé");
-        assert!(view[0].spans[0].content.contains("expired"), "expirado vai pro topo");
-        assert!(view[1].spans[0].content.contains("d left"), "dias crescentes após expirados");
-        assert!(view[2].spans[0].content.contains("30d left"));
-        assert!(view[2].spans[1].content.chars().count() <= 20, "nome cortado a 20");
+        assert!(view[0].spans[1].content.contains("expired"), "expirado vai pro topo");
+        assert!(view[1].spans[1].content.contains("▰"), "gauge quando há dias");
+        assert!(view[1].spans[3].content.contains("d left"));
+        assert!(view[2].spans[3].content.contains("30d left"));
+        assert!(view[2].spans[4].content.trim().chars().count() <= 20, "nome cortado a 20");
         assert!(view[3].spans[0].content.contains("3 apps"), "rodapé resume");
         assert!(view[3].spans[0].content.contains("1 expired"), "rodapé conta expirados");
     }
@@ -1533,7 +1581,7 @@ mod tests {
     #[test]
     fn version_panel_and_login_accounts() {
         let v = command_view("version", &serde_json::json!({"version":"1.2.10"}));
-        assert!(v[0].spans[0].content.contains("tui 0.1.0"));
+        assert!(v[0].spans[0].content.contains("openside v0.1.0"));
         assert!(v[1].spans[0].content.contains("engine 1.2.10"));
         let acc = command_view("login", &serde_json::json!({"accounts":[{"email":"a@b","team_id":"T1","active":true}]}));
         assert!(acc[0].spans[0].content.contains("●"));
@@ -1547,8 +1595,9 @@ mod tests {
         assert!(empty[0].spans[0].content.contains("no iPhone"));
         let d = serde_json::json!([{"serial":"00008030-0009454E0C84802E","connection_type":"USB","device_id":1}]);
         let rows = devices_view(&d);
-        assert!(rows[0].spans[2].content.contains("802E"));
+        assert!(rows[0].spans[3].content.contains("802E"));
         assert!(rows[0].spans[0].content.contains("●"));
+        assert!(rows[0].spans[2].content.contains("USB"), "chip de conexão");
     }
 
     #[test]
