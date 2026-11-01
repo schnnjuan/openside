@@ -271,6 +271,10 @@ struct App {
     dialog: Option<Dialog>,
     /// app action waiting for the next `installs` result
     app_action: Option<AppAction>,
+    /// apps with signature expiry in under 15 days (installs data)
+    expiring: usize,
+    /// apps already expired (installs data)
+    expired: usize,
     next_id: u64,
 }
 
@@ -314,6 +318,8 @@ impl App {
             devices: None,
             dialog: None,
             app_action: None,
+            expiring: 0,
+            expired: 0,
             next_id: 1,
         }
     }
@@ -375,6 +381,18 @@ impl App {
                             self.dialog = Some(dialog);
                         } else {
                             self.note("no sideloaded apps recorded");
+                        }
+                    }
+                }
+                // header counters: expiry window of the installs
+                if ok && self.last_cmd == "installs" {
+                    for item in data.as_array().unwrap_or(&vec![]) {
+                        let expired = item.get("expired").and_then(Value::as_bool).unwrap_or(false);
+                        let days = item.get("days_left").and_then(Value::as_u64).unwrap_or(999);
+                        if expired {
+                            self.expired += 1;
+                        } else if days < 15 {
+                            self.expiring += 1;
                         }
                     }
                 }
@@ -1039,24 +1057,47 @@ fn main() -> io::Result<()> {
             let header =
                 Layout::horizontal([Constraint::Length(56), Constraint::Min(0)]).split(rows[0]);
             f.render_widget(Paragraph::new(logo_lines("openside")), header[0]);
-            let chips_band: [Rect; 2] =
-                Layout::vertical([Constraint::Length(5), Constraint::Length(1)]).areas(header[1]);
+            let bands: [Rect; 3] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .areas(header[1]);
             let n_devices = connected(&app.devices);
+            // line state: busy with engine spinner or last command executed
+            let state_line = match &app.spinner {
+                Some(line) => Line::from(vec![
+                    Span::styled("⠿ ", st(CY)),
+                    Span::styled(line.clone(), st(YEL)),
+                ]),
+                None if !app.last_cmd.is_empty() => Line::from(vec![
+                    Span::styled("● ", st(GRN)),
+                    Span::styled(format!("{} ", app.last_cmd), st(GRAY)),
+                ]),
+                None => Line::from(vec![Span::styled("● ready", st(GRN))]),
+            };
+            f.render_widget(Paragraph::new(state_line).style(Style::new().bg(BG)), bands[0]);
+            let mut chips = vec![Span::styled(
+                format!("{dot} {n_devices} device{plural}", dot = if n_devices > 0 { "●" } else { "○" }, plural = if n_devices == 1 { "" } else { "s" }),
+                st(if n_devices > 0 { GRN } else { GRAY }),
+            )];
+            if app.expired > 0 {
+                chips.push(Span::raw("  "));
+                chips.push(Span::styled(format!("! {expired} expired", expired = app.expired), st(RED)));
+            }
+            if app.expiring > 0 {
+                chips.push(Span::raw("  "));
+                chips.push(Span::styled(format!("⚠ {exp} expiring", exp = app.expiring), st(YEL)));
+            }
+            if let Some(v) = ENGINE_VERSION.get() {
+                chips.push(Span::raw("  "));
+                chips.push(Span::styled(format!("engine {v}"), st(GRAY)));
+            }
             f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled("v0.1.0  ", st(GRAY)),
-                    Span::styled(" anx set ", Style::new().fg(DARK).bg(GRAY)),
-                    Span::raw(" "),
-                    Span::styled(format!(" engine {} ", ENGINE_VERSION.get().map(String::as_str).unwrap_or("…")), Style::new().fg(BG).bg(CY)),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!(" {dot} {n_devices} device{plural} ", dot = if n_devices > 0 { "●" } else { "○" }, plural = if n_devices == 1 { "" } else { "s" }),
-                        Style::new().fg(BG).bg(if n_devices > 0 { GRN } else { GRAY }),
-                    ),
-                ]))
-                .alignment(ratatui::layout::Alignment::Right)
-                .style(Style::new().bg(BG)),
-                chips_band[1],
+                Paragraph::new(Line::from(chips))
+                    .alignment(ratatui::layout::Alignment::Right)
+                    .style(Style::new().bg(BG)),
+                bands[2],
             );
 
             let body = Layout::horizontal([Constraint::Length(32), Constraint::Min(0)])
