@@ -1045,8 +1045,11 @@ fn installs_view(data: &Value) -> Vec<Line<'static>> {
             } else {
                 ("? unknown".to_string(), GRAY, String::new())
             };
-            let mut spans = vec![Span::styled(" ● ", st(col))];
-            if !gauge.is_empty() {
+            let mut spans = vec![Span::styled("● ", st(col))];
+            if gauge.is_empty() {
+                // sem gauge: mantém a coluna do badge alinhada com as outras linhas
+                spans.push(Span::raw("           "));
+            } else {
                 spans.push(Span::styled(gauge, st(col)));
                 spans.push(Span::raw(" "));
             }
@@ -1364,31 +1367,25 @@ fn main() -> io::Result<()> {
             f.render_widget(Block::default().style(Style::new().bg(BG)), area);
 
             let rows = Layout::vertical([
-                Constraint::Length(8),
-                Constraint::Length(1),
+                Constraint::Length(6),
+                Constraint::Length(2),
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
             .split(area);
+            // logo flush (2 linhas de gape abaixo antes do corpo)
             let header =
                 Layout::horizontal([Constraint::Length(58), Constraint::Min(0)]).split(rows[0]);
-            // logo com respiro: 2 col à esquerda, centrada verticalmente na banda
-            let band: [Rect; 3] = Layout::vertical([
-                Constraint::Length(1),
-                Constraint::Length(6),
-                Constraint::Length(1),
-            ])
-            .areas(header[0]);
             let slot: [Rect; 3] = Layout::horizontal([
                 Constraint::Length(2),
                 Constraint::Length(56),
                 Constraint::Min(0),
             ])
-            .areas(band[1]);
+            .areas(rows[0]);
             f.render_widget(Paragraph::new(logo_lines("openside")), slot[1]);
             // badges centrados na altura do logo (sem linha de estado — o footer mostra)
             let bands: [Rect; 3] = Layout::vertical([
-                Constraint::Length(4),
+                Constraint::Length(3),
                 Constraint::Length(1),
                 Constraint::Min(0),
             ])
@@ -1469,7 +1466,9 @@ fn main() -> io::Result<()> {
             let log_inner = box_title(f, body[1], &title, MAG);
             if panel_live {
                 f.render_widget(
-                    Paragraph::new(app.panel.clone()).style(Style::new().bg(BG)),
+                    Paragraph::new(app.panel.clone())
+                        .style(Style::new().bg(BG))
+                        .wrap(ratatui::widgets::Wrap { trim: false }),
                     log_inner,
                 );
             } else {
@@ -1778,7 +1777,7 @@ mod tests {
         .unwrap();
         let view = installs_view(&d);
         assert_eq!(view.len(), 4, "3 apps + rodapé");
-        assert!(view[0].spans[1].content.contains("expired"), "expirado vai pro topo");
+        assert!(view[0].spans[2].content.contains("expired"), "expirado vai pro topo");
         assert!(view[1].spans[1].content.contains("▰"), "gauge quando há dias");
         assert!(view[1].spans[3].content.contains("d left"));
         assert!(view[2].spans[3].content.contains("30d left"));
