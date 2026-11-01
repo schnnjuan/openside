@@ -1036,8 +1036,8 @@ fn main() -> io::Result<()> {
                 Constraint::Length(1),
             ])
             .split(area);
-            let header = Layout::horizontal([Constraint::Length(46), Constraint::Min(0)])
-                .split(rows[0]);
+            let header =
+                Layout::horizontal([Constraint::Length(56), Constraint::Min(0)]).split(rows[0]);
             f.render_widget(Paragraph::new(logo_lines("openside")), header[0]);
             let chips_band: [Rect; 2] =
                 Layout::vertical([Constraint::Length(5), Constraint::Length(1)]).areas(header[1]);
