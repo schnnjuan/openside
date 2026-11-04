@@ -1416,7 +1416,7 @@ fn activate_menu(app: &mut App) {
 }
 
 fn start_login(app: &mut App) {
-    open_input_dialog(app, "Apple ID e-mail:", false);
+    open_input_dialog(app, t("Apple ID e-mail:", "e-mail do Apple ID:"), false);
 }
 
 fn open_input_dialog(app: &mut App, prompt: &str, masked: bool) {
@@ -1452,21 +1452,22 @@ fn submit_input(app: &mut App, buffer: String) {
         }
         return;
     }
-    if stage.contains("e-mail") {
-        let existed = app.login.is_some();
-        open_input_dialog(app, "app-specific password:", true);
-        app.login = Some(match app.login.take() {
-            Some(flow) => LoginFlow { email: value, ..flow },
-            None => LoginFlow {
-                email: value,
-                password: String::new(),
-                creds: std::path::PathBuf::new(),
-            },
+    // e-mail step: no wizard flow yet (title text can't drive the flow —
+    // it's translated)
+    if app.login.is_none() {
+        open_input_dialog(
+            app,
+            t("app-specific password:", "senha específica de app:"),
+            true,
+        );
+        app.login = Some(LoginFlow {
+            email: value,
+            password: String::new(),
+            creds: std::path::PathBuf::new(),
         });
-        let _notify = existed;
         return;
     }
-    if stage.contains("password") {
+    if !stage.contains("2FA") {
         if let Some(flow) = app.login.as_mut() {
             flow.password = value;
             flow.creds = write_creds(&flow.email, &flow.password);
@@ -1540,9 +1541,12 @@ fn main() -> io::Result<()> {
         }
     };
     let mut app = App::new();
-    // language picker on the first run — reads ~/.config/openside/language
+    // language picker on the first run — the title stays bilingual because
+    // the language isn't chosen yet
     if read_saved_lang().is_none() {
-        app.dialog = Some(language_dialog());
+        let mut dialog = language_dialog();
+        dialog.title = "language / idioma".into();
+        app.dialog = Some(dialog);
     }
     let mut log_bottom = true; // stick to the tail until the user scrolls
     let mut log_stored: u16 = 0;
