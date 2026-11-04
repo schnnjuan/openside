@@ -210,8 +210,6 @@ enum Choice {
     Uninstall(String), // bundle id
     Refresh(String),   // bundle id
     Forget(String),    // bundle id
-    /// arbitrary `<cmd> <one-arg>` (inspect/sign .ipa)
-    RunWith(String, String),
     /// language picker on first run
     SetLang(Lang),
 }
@@ -219,6 +217,14 @@ enum Choice {
 enum DialogKind {
     Pick { items: Vec<(String, Choice)>, sel: usize },
     Input { prompt: String, masked: bool, buffer: String },
+    /// ls/cd file browser for .ipa files: cwd + subdirs + *.ipa rows
+    Browse {
+        path: String,
+        /// (name, is_dir); files are .ipa only
+        entries: Vec<(String, bool)>,
+        /// 0 = parent (..), then entries, last = "type path" row
+        sel: usize,
+    },
 }
 
 enum Item {
@@ -328,6 +334,10 @@ struct App {
     expiring: usize,
     /// apps already expired (installs data)
     expired: usize,
+    /// .ipa command waiting on the browse dialog's "type path" row
+    ipa_cmd: Option<&'static str>,
+    /// bottom-bar language button on the output panel (version screen)
+    show_lang: bool,
     next_id: u64,
 }
 
@@ -363,6 +373,8 @@ impl App {
             selection: 0,
             panel: vec![],
             last_cmd: String::new(),
+            ipa_cmd: None,
+            show_lang: false,
             log: vec![Line::from(Span::styled(
                 "openside — pick with ↑↓, run with ⏎",
                 st(GRAY),
@@ -443,6 +455,9 @@ impl App {
                         }
                     }
                 }
+                // bottom bar of the output panel: the version screen gains a
+                // language button (click → language picker)
+                self.show_lang = ok && self.last_cmd == "version";
                 // header counters: expiry window of the installs (recomputed, not accumulated)
                 if ok && self.last_cmd == "installs" {
                     self.expired = 0;
@@ -545,49 +560,154 @@ fn choice_for(action: AppAction) -> fn(String) -> Choice {
     }
 }
 
-/// scan for sideloadable .ipas — same roots/depth/cap as the engine
-/// (`_candidate_ipas`), so the picker never shows an illusion of files
-fn ipa_candidates() -> Vec<String> {
-    let env = std::env::var("IPASIDE_IPA_DIRS")
-        .or_else(|_| std::env::var("OPENSIDE_IPA_DIRS"))
-        .unwrap_or_default();
-    let dirs: Vec<String> = if env.is_empty() {
-        vec![
-            ".".to_string(),
-            format!("{}/Downloads", home_dir()),
-            format!("{}/Desktop", home_dir()),
-            format!("{}/Documents", home_dir()),
-        ]
-    } else {
-        env.split(':').filter(|d| !d.is_empty()).map(String::from).collect()
+/// ls/cd file browser — mirrors the engine's trust in the filesystem;
+/// shows only subdirs + *.ipa, dot-files hidden
+fn list_dir_items(path: &str) -> Vec<(String, bool)> {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return vec![];
     };
-    // BFS one level of subdirectories, like the engine (depth 2)
-    let mut found: Vec<(std::time::SystemTime, String)> = vec![];
-    let mut queue: Vec<(std::path::PathBuf, u8)> = dirs
-        .iter()
-        .map(|d| (std::path::PathBuf::from(d), 0))
-        .collect();
-    let mut seen = std::collections::HashSet::new();
-    while let Some((dir, level)) = queue.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    let mut dirs: Vec<(String, bool)> = vec![];
+    let mut ipas: Vec<(String, bool)> = vec![];
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
             continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let is_file = path.is_file();
-            if is_file && path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("ipa")) == Some(true) {
-                if let (Ok(key), Ok(meta)) = (path.canonicalize(), entry.metadata()) {
-                    if seen.insert(key) {
-                        found.push((meta.modified().unwrap_or(std::time::UNIX_EPOCH), path.to_string_lossy().into_owned()));
-                    }
-                }
-            } else if path.is_dir() && level < 2 {
-                queue.push((path, level + 1));
-            }
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            dirs.push((name, true));
+        } else if name.to_lowercase().ends_with(".ipa") {
+            ipas.push((name, false));
         }
     }
-    found.sort_by(|a, b| b.0.cmp(&a.0)); // mais recente primeiro
-    found.into_iter().take(40).map(|(_, p)| p).collect()
+    dirs.sort();
+    ipas.sort();
+    dirs.extend(ipas);
+    dirs.truncate(200);
+    dirs
+}
+
+/// the start dir of the browser: first existing of ~/Downloads, ~/Desktop,
+/// ~/Documents, else home
+fn browse_start_dir() -> String {
+    let home = std::path::PathBuf::from(home_dir());
+    for cand in ["Downloads", "Desktop", "Documents"] {
+        let p = home.join(cand);
+        if p.is_dir() {
+            return p.to_string_lossy().into_owned();
+        }
+    }
+    home.to_string_lossy().into_owned()
+}
+
+fn browse_dialog(path: String, title: String) -> Dialog {
+    let entries = list_dir_items(&path);
+    Dialog {
+        title,
+        kind: DialogKind::Browse { path, entries, sel: 0 },
+    }
+}
+
+/// language picker (first run + the version-screen button)
+fn language_dialog() -> Dialog {
+    Dialog {
+        title: t("language", "idioma").to_string(),
+        kind: DialogKind::Pick {
+            items: vec![
+                ("English".to_string(), Choice::SetLang(Lang::En)),
+                ("Português (BR)".to_string(), Choice::SetLang(Lang::PtBr)),
+            ],
+            sel: 0,
+        },
+    }
+}
+
+/// open the ls/cd .ipa browser for a command that takes a path
+fn open_ipa_browse(app: &mut App, cmd: &'static str) {
+    app.ipa_cmd = Some(cmd);
+    app.dialog = Some(browse_dialog(
+        browse_start_dir(),
+        format!("{} {} {cmd}?", t("which .ipa", "qual .ipa"), t("for", "para")),
+    ));
+}
+
+/// Enter in the browser: cd down/up, or run the command on the chosen .ipa,
+/// or fall into the direct-path input
+fn browse_confirm(app: &mut App) {
+    let path = match &app.dialog {
+        Some(Dialog { kind: DialogKind::Browse { path, .. }, .. }) => path.clone(),
+        _ => return,
+    };
+    let (entries, sel) = match &app.dialog {
+        Some(Dialog { kind: DialogKind::Browse { entries, sel, .. }, .. }) => {
+            (entries.len(), *sel)
+        }
+        _ => return,
+    };
+    let title = app.dialog.as_ref().map(|d| d.title.clone()).unwrap_or_default();
+    if sel == 0 {
+        // parent; stay at the filesystem root
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            let parent = parent.to_string_lossy().into_owned();
+            if !parent.is_empty() {
+                app.dialog = Some(browse_dialog(parent, title));
+                return;
+            }
+        }
+        app.dialog = Some(browse_dialog(path, title));
+    } else if sel > entries {
+        // "type path" row
+        app.dialog = Some(Dialog {
+            title: t(".ipa path:", "caminho do .ipa:").to_string(),
+            kind: DialogKind::Input {
+                prompt: t("direct path to the .ipa:", "caminho direto do .ipa:").to_string(),
+                masked: false,
+                buffer: String::new(),
+            },
+        });
+    } else {
+        let (name, is_dir) = entries_vec(app, sel);
+        if is_dir {
+            let child = format!("{path}/{name}");
+            app.dialog = Some(browse_dialog(child, title));
+        } else if let Some(cmd) = app.ipa_cmd.take() {
+            app.dialog = None;
+            app.run(vec![cmd.to_string(), format!("{path}/{name}")]);
+        }
+    }
+}
+
+/// pull the selected entry out of the open Browse dialog
+fn entries_vec(app: &mut App, sel: usize) -> (String, bool) {
+    let out = (
+        String::new(),
+        false,
+    );
+    if let Some(Dialog { kind: DialogKind::Browse { entries, .. }, .. }) = app.dialog.as_mut() {
+        if let Some((name, is_dir)) = entries.get(sel - 1) {
+            return (name.clone(), *is_dir);
+        }
+    }
+    out
+}
+
+/// Escape/Backspace in the browser: one level up
+fn browse_up(app: &mut App) {
+    let (path, title) = match app.dialog.take() {
+        Some(Dialog {
+            title,
+            kind: DialogKind::Browse { path, .. },
+        }) => (path, title),
+        _ => return,
+    };
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let parent = parent.to_string_lossy().into_owned();
+        if !parent.is_empty() {
+            app.dialog = Some(browse_dialog(parent, title));
+            return;
+        }
+    }
+    app.dialog = Some(browse_dialog(path, title));
 }
 
 fn home_dir() -> String {
@@ -1262,27 +1382,6 @@ fn relative_selection(from: usize, dir: i32, count: usize) -> usize {
 }
 
 /// open the .ipa picker for a command that takes a path
-fn open_ipa_picker(app: &mut App, cmd: &'static str) {
-    let found = ipa_candidates();
-    if found.is_empty() {
-        app.note(t("no .ipa in ~/Downloads, ~/Desktop, ~/Documents or cwd (set IPASIDE_IPA_DIRS to add dirs)", "sem .ipa em ~/Downloads, ~/Desktop, ~/Documents ou cwd (defina IPASIDE_IPA_DIRS para mais pastas)"));
-    } else {
-        app.dialog = Some(Dialog {
-            title: format!("{} {} {cmd}?", t("which .ipa", "qual .ipa"), t("for", "para")),
-            kind: DialogKind::Pick {
-                items: found
-                    .into_iter()
-                    .map(|p| {
-                        let label = p.rsplit('/').next().unwrap_or(&p).to_string();
-                        (label, Choice::RunWith(cmd.to_string(), p))
-                    })
-                    .collect(),
-                sel: 0,
-            },
-        });
-    }
-}
-
 fn connected(devices: &Option<Value>) -> usize {
     devices
         .as_ref()
@@ -1306,7 +1405,7 @@ fn activate_menu(app: &mut App) {
             let parts: Vec<String> = cmd.split_whitespace().map(String::from).collect();
             app.run(parts);
         }
-        Item::PickIpa(cmd) => open_ipa_picker(app, cmd),
+        Item::PickIpa(cmd) => open_ipa_browse(app, cmd),
         Item::PickApp(action) => {
             app.app_action = Some(*action);
             app.run(vec!["installs".into()]);
@@ -1339,6 +1438,18 @@ fn submit_input(app: &mut App, buffer: String) {
         None => return,
     };
     if value.is_empty() {
+        return;
+    }
+    // direct .ipa path typed from the browse dialog's last row
+    if stage.contains(".ipa") {
+        let Some(cmd) = app.ipa_cmd.take() else {
+            return;
+        };
+        if std::path::Path::new(&value).exists() {
+            app.run(vec![cmd.to_string(), value]);
+        } else {
+            app.note(t("path not found", "caminho não existe"));
+        }
         return;
     }
     if stage.contains("e-mail") {
@@ -1405,7 +1516,6 @@ fn confirm_dialog(app: &mut App) {
         match dialog.kind {
             DialogKind::Pick { items, sel } => match items.into_iter().nth(sel) {
 
-                Some((_, Choice::RunWith(cmd, arg))) => app.run(vec![cmd, arg]),
                 Some((_, Choice::Uninstall(bundle))) => app.run(vec!["uninstall".into(), bundle]),
                 Some((_, Choice::Refresh(bundle))) => app.run(vec!["refresh".into(), bundle]),
                 Some((_, Choice::Forget(bundle))) => app.run(vec!["forget".into(), bundle]),
@@ -1432,16 +1542,7 @@ fn main() -> io::Result<()> {
     let mut app = App::new();
     // language picker on the first run — reads ~/.config/openside/language
     if read_saved_lang().is_none() {
-        app.dialog = Some(Dialog {
-            title: "language / idioma".into(),
-            kind: DialogKind::Pick {
-                items: vec![
-                    ("English".to_string(), Choice::SetLang(Lang::En)),
-                    ("Português (BR)".to_string(), Choice::SetLang(Lang::PtBr)),
-                ],
-                sel: 0,
-            },
-        });
+        app.dialog = Some(language_dialog());
     }
     let mut log_bottom = true; // stick to the tail until the user scrolls
     let mut log_stored: u16 = 0;
@@ -1468,6 +1569,7 @@ fn main() -> io::Result<()> {
 
         let mut hit_menu_list = Rect::default();
         let mut hit_dialog_list = Rect::default();
+        let mut hit_lang_btn = Rect::default();
         terminal.draw(|f| {
             let area = f.area();
             f.render_widget(Block::default().style(Style::new().bg(BG)), area);
@@ -1503,7 +1605,11 @@ fn main() -> io::Result<()> {
             .areas(header[1]);
             let n_devices = connected(&app.devices);
             let mut chips = vec![
-                Span::styled("v0.1.0  ", st(GRAY)),
+                Span::styled(
+                    " 0.1.0 ",
+                    Style::new().fg(BG).bg(MAG).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
                 Span::styled(" anx set ", Style::new().fg(DARK).bg(GRAY)),
                 Span::raw(" "),
                 Span::styled(format!(" engine {} ", ENGINE_VERSION.get().map(String::as_str).unwrap_or("…")), Style::new().fg(BG).bg(CY)),
@@ -1595,6 +1701,28 @@ fn main() -> io::Result<()> {
                     log_inner,
                 );
             }
+            // output-panel bottom bar: language button on the version screen
+            // (label is language-neutral on purpose)
+            if app.show_lang && log_inner.height > 0 {
+                let bar = Rect {
+                    x: log_inner.x,
+                    y: log_inner.y + log_inner.height - 1,
+                    width: log_inner.width,
+                    height: 1,
+                };
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        " ● language / idioma ",
+                        Style::new()
+                            .fg(BG)
+                            .bg(MAG)
+                            .add_modifier(Modifier::BOLD),
+                    )))
+                    .style(Style::new().bg(MAG)),
+                    bar,
+                );
+                hit_lang_btn = bar;
+            }
 
             // footer
             f.render_widget(
@@ -1628,32 +1756,51 @@ fn main() -> io::Result<()> {
 
             // dialog overlay (last = on top)
             if let Some(dlog) = &app.dialog {
-                match &dlog.kind {
-                    DialogKind::Pick { items, .. } => {
-                        let width = (57.min(area.width.saturating_sub(4))).max(20);
-                        let height =
-                            (items.len() as u16 + 5).min(rows[2].height.saturating_sub(2));
-                        let x = area.x + (area.width.saturating_sub(width)) / 2;
-                        let y = rows[2].y + (rows[2].height.saturating_sub(height)) / 2;
-                        let inner = box_title(f, Rect { x, y, width, height }, &dlog.title, YEL);
-                        hit_dialog_list = inner;
-                        let sel_now = match &dlog.kind {
-                            DialogKind::Pick { sel, .. } => *sel,
-                            _ => 0,
-                        };
-                        let mut dsel = ListState::default();
-                        dsel.select(Some(sel_now));
-                        f.render_stateful_widget(
-                            List::new(
-                                items.iter().map(|(label, _)| label.clone()).collect::<Vec<String>>(),
-                            )
+                // Pick and Browse share the list skeleton; Browse adds
+                // ".." + the "type path" row on top of its entries
+                let list = match &dlog.kind {
+                    DialogKind::Pick { items, sel } => Some((
+                        items
+                            .iter()
+                            .map(|(label, _)| label.clone())
+                            .collect::<Vec<String>>(),
+                        *sel,
+                        items.len(),
+                    )),
+                    DialogKind::Browse { entries, sel, .. } => {
+                        let mut labels: Vec<String> = vec!["..".to_string()];
+                        for (name, is_dir) in entries {
+                            if *is_dir {
+                                labels.push(format!("{name}/"));
+                            } else {
+                                labels.push(name.clone());
+                            }
+                        }
+                        labels.push(
+                            t("… type the path", "… digitar caminho").to_string(),
+                        );
+                        Some((labels, *sel, entries.len() + 2))
+                    }
+                    _ => None,
+                };
+                if let Some((labels, sel_now, count)) = list.as_ref() {
+                    let width = (57.min(area.width.saturating_sub(4))).max(20);
+                    let height = (*count as u16 + 5).min(rows[2].height.saturating_sub(2));
+                    let x = area.x + (area.width.saturating_sub(width)) / 2;
+                    let y = rows[2].y + (rows[2].height.saturating_sub(height)) / 2;
+                    let inner = box_title(f, Rect { x, y, width, height }, &dlog.title, YEL);
+                    hit_dialog_list = inner;
+                    let mut dsel = ListState::default();
+                    dsel.select(Some(*sel_now));
+                    f.render_stateful_widget(
+                        List::new(labels.clone())
                             .highlight_symbol("» ")
                             .highlight_style(st(Color::White).add_modifier(Modifier::BOLD)),
-                            inner,
-                            &mut dsel,
-                        );
-                    }
-                    DialogKind::Input { prompt, masked, buffer } => {
+                        inner,
+                        &mut dsel,
+                    );
+                }
+                if let DialogKind::Input { prompt, masked, buffer } = &dlog.kind {
                         let shown = if *masked && !buffer.is_empty() {
                             "●".repeat(buffer.len())
                         } else if buffer.is_empty() {
@@ -1681,7 +1828,6 @@ fn main() -> io::Result<()> {
                             Paragraph::new(Line::from(Span::styled(shown, st(Color::White).add_modifier(Modifier::BOLD)))),
                             dims[1],
                         );
-                    }
                 }
             }
         })?;
@@ -1708,6 +1854,22 @@ fn main() -> io::Result<()> {
                             }
                             crossterm::event::KeyCode::Esc => app.dialog = None,
                             crossterm::event::KeyCode::Enter => confirm_dialog(&mut app),
+                            _ => {}
+                        },
+                        DialogKind::Browse { entries, sel, .. } => match key.code {
+                            crossterm::event::KeyCode::Up => *sel = sel.saturating_sub(1),
+                            crossterm::event::KeyCode::Down => {
+                                *sel = (*sel + 1).min(entries.len() + 1)
+                            }
+                            crossterm::event::KeyCode::PageUp => {
+                                *sel = sel.saturating_sub(10)
+                            }
+                            crossterm::event::KeyCode::PageDown => {
+                                *sel = (*sel + 10).min(entries.len() + 1)
+                            }
+                            crossterm::event::KeyCode::Esc => app.dialog = None,
+                            crossterm::event::KeyCode::Enter => browse_confirm(&mut app),
+                            crossterm::event::KeyCode::Backspace => browse_up(&mut app),
                             _ => {}
                         },
                         DialogKind::Input { buffer, .. } => match key.code {
@@ -1773,17 +1935,24 @@ fn main() -> io::Result<()> {
                 crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                     let (mx, my) = (mouse.column, mouse.row);
                     if app.dialog.is_some() {
+                        let mut confirmed = false;
                         if my >= hit_dialog_list.y
                             && my < hit_dialog_list.y + hit_dialog_list.height
                             && mx >= hit_dialog_list.x
                         {
                             if let Some(Dialog { kind, .. }) = app.dialog.as_mut() {
-                                if let DialogKind::Pick { items, sel } = kind {
+                                let count = match kind {
+                                    DialogKind::Pick { items, .. } => items.len(),
+                                    DialogKind::Browse { entries, .. } => entries.len() + 2,
+                                    _ => 0,
+                                };
+                                if let DialogKind::Pick { sel, .. }
+                                | DialogKind::Browse { sel, .. } = kind
+                                {
                                     let idx = (my - hit_dialog_list.y) as usize;
-                                    let idx = idx.min(items.len().saturating_sub(1));
+                                    let idx = idx.min(count.saturating_sub(1));
                                     if idx == *sel && last_click == Some((mx, my)) {
-                                        confirm_dialog(&mut app);
-                                        last_click = None;
+                                        confirmed = true;
                                     } else {
                                         *sel = idx;
                                         last_click = Some((mx, my));
@@ -1794,6 +1963,24 @@ fn main() -> io::Result<()> {
                             app.dialog = None;
                             last_click = None;
                         }
+                        if confirmed {
+                            let browse =
+                                app.dialog.as_ref().map(|d| matches!(d.kind, DialogKind::Browse { .. })).unwrap_or(false);
+                            if browse {
+                                browse_confirm(&mut app);
+                            } else {
+                                confirm_dialog(&mut app);
+                            }
+                            last_click = None;
+                        }
+                    } else if hit_lang_btn.height > 0
+                        && my == hit_lang_btn.y
+                        && mx >= hit_lang_btn.x
+                        && mx < hit_lang_btn.x + hit_lang_btn.width
+                    {
+                        // language button on the version screen
+                        app.dialog = Some(language_dialog());
+                        last_click = None;
                     } else if my >= hit_menu_list.y
                         && my < hit_menu_list.y + hit_menu_list.height
                         && mx >= hit_menu_list.x
@@ -1870,6 +2057,35 @@ mod tests {
         };
         assert_eq!(items.len(), 2);
         assert!(matches!(items[1].1, Choice::Uninstall(ref b) if b == "x.app"));
+    }
+
+    #[test]
+    fn browse_lists_dirs_first_then_ipas() {
+        let dir = std::env::temp_dir()
+            .join(format!("openside-browse-{}-{}", std::process::id(), rand_usize()));
+        std::fs::create_dir_all(dir.join("z_dir")).unwrap();
+        std::fs::write(dir.join("z.ipa"), "x").unwrap();
+        std::fs::write(dir.join("readme.txt"), "x").unwrap();
+        std::fs::write(dir.join(".hidden"), "x").unwrap();
+        std::fs::create_dir_all(dir.join("a_dir")).unwrap();
+        let items = list_dir_items(dir.to_string_lossy().as_ref());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            items,
+            vec![
+                ("a_dir".to_string(), true),
+                ("z_dir".to_string(), true),
+                ("z.ipa".to_string(), false),
+            ]
+        );
+    }
+
+    /// small trick so parallel tests never share a scratch dir
+    fn rand_usize() -> usize {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as usize)
+            .unwrap_or(0)
     }
 
     #[test]
@@ -1993,5 +2209,6 @@ mod tests {
         assert!(!tidy_value("caminho/normal.ipa").contains('…'), "caminho comum intacto");
     }
 }
+
 
 
