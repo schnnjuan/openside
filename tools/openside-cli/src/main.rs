@@ -805,6 +805,35 @@ fn command_view(cmd: &str, data: &Value) -> Vec<Line<'static>> {
     }
 }
 
+/// panel tab title for the last command — commands are IDs, so they get a
+/// display map instead of `t()`
+fn tab_title(cmd: &str) -> &'static str {
+    match cmd {
+        "doctor" => t("doctor", "diagnóstico"),
+        "devices" => t("devices", "aparelhos"),
+        "device-info" => t("device info", "info do aparelho"),
+        "installs" => t("installs", "apps instalados"),
+        "refresh" => t("refresh", "renovar"),
+        "signed" => t("signed .ipas", ".ipas assinados"),
+        "teams" => t("teams", "equipes"),
+        "slots" => "slots",
+        "apps" => t("apps on device", "apps no aparelho"),
+        "developer-mode" => t("developer mode", "modo dev"),
+        "pairing" => t("pairing", "pareamento"),
+        "jailbreak" => "jailbreak",
+        "inspect" => t("inspect .ipa", "inspecionar .ipa"),
+        "anisette" => "anisette",
+        "apple-support" => "apple-support",
+        "login" => t("apple id", "apple id"),
+        "version" => t("version", "versão"),
+        "sideload" => "sideload",
+        "sign" => t("sign .ipa", "assinar .ipa"),
+        "uninstall" => t("uninstall", "desinstalar"),
+        "forget" => t("forget", "esquecer"),
+        _ => "output",
+    }
+}
+
 /// "ios_version" → "iOS Version"; "udid" → "UDID"
 fn humanize(key: &str) -> String {
     key.split(['_', '-'])
@@ -1689,7 +1718,14 @@ fn main() -> io::Result<()> {
 
             let panel_live = !app.panel.is_empty();
             let title = if panel_live {
-                format!("{} ", if app.last_cmd.is_empty() { t("output", "saída") } else { &app.last_cmd })
+                format!(
+                    "{} ",
+                    if app.last_cmd.is_empty() {
+                        t("output", "saída")
+                    } else {
+                        tab_title(&app.last_cmd)
+                    }
+                )
             } else {
                 format!("{} — {} {}", t("ticker", "ticker"), app.log.len(), t("lines", "linhas"))
             };
