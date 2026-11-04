@@ -1616,7 +1616,16 @@ fn main() -> io::Result<()> {
                 Span::raw(" "),
                 Span::styled(" anx set ", Style::new().fg(DARK).bg(GRAY)),
                 Span::raw(" "),
-                Span::styled(format!(" engine {} ", ENGINE_VERSION.get().map(String::as_str).unwrap_or("…")), Style::new().fg(BG).bg(CY)),
+                Span::styled(
+                    format!(
+                        " engine {} ",
+                        ENGINE_VERSION.get().map(String::as_str).unwrap_or("…")
+                    ),
+                    Style::new()
+                        .fg(BG)
+                        .bg(CY)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" "),
             ];
             if app.expired > 0 {
@@ -1705,27 +1714,21 @@ fn main() -> io::Result<()> {
                     log_inner,
                 );
             }
-            // output-panel bottom bar: language button on the version screen
-            // (label is language-neutral on purpose)
-            if app.show_lang && log_inner.height > 0 {
-                let bar = Rect {
-                    x: log_inner.x,
-                    y: log_inner.y + log_inner.height - 1,
-                    width: log_inner.width,
-                    height: 1,
-                };
+            // language button on the version screen: a small badge right
+            // below the version badges (label is language-neutral on purpose)
+            if app.show_lang && log_inner.height > 2 {
+                // one row below the badges (panel is the 2-badge version view)
+                let row = (app.panel.len() + 1).min(log_inner.height as usize - 1) as u16;
+                let btn = Rect { x: log_inner.x, y: log_inner.y + row, width: 20, height: 1 };
                 f.render_widget(
                     Paragraph::new(Line::from(Span::styled(
-                        " ● language / idioma ",
-                        Style::new()
-                            .fg(BG)
-                            .bg(MAG)
-                            .add_modifier(Modifier::BOLD),
+                        " language/idioma ",
+                        Style::new().fg(BG).bg(MAG),
                     )))
                     .style(Style::new().bg(MAG)),
-                    bar,
+                    btn,
                 );
-                hit_lang_btn = bar;
+                hit_lang_btn = btn;
             }
 
             // footer
@@ -2213,6 +2216,7 @@ mod tests {
         assert!(!tidy_value("caminho/normal.ipa").contains('…'), "caminho comum intacto");
     }
 }
+
 
 
 
