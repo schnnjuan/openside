@@ -389,8 +389,10 @@ impl App {
                         }
                     }
                 }
-                // header counters: expiry window of the installs
+                // header counters: expiry window of the installs (recomputed, not accumulated)
                 if ok && self.last_cmd == "installs" {
+                    self.expired = 0;
+                    self.expiring = 0;
                     for item in data.as_array().unwrap_or(&vec![]) {
                         let expired = item.get("expired").and_then(Value::as_bool).unwrap_or(false);
                         let days = item.get("days_left").and_then(Value::as_u64).unwrap_or(999);
@@ -484,32 +486,53 @@ fn choice_for(action: AppAction) -> fn(String) -> Choice {
     }
 }
 
-/// scan common dirs for sideloadable .ipas (env override: OPENSIDE_IPA_DIRS)
+/// scan for sideloadable .ipas — same roots/depth/cap as the engine
+/// (`_candidate_ipas`), so the picker never shows an illusion of files
 fn ipa_candidates() -> Vec<String> {
-    let dirs = std::env::var("OPENSIDE_IPA_DIRS").unwrap_or_else(|_| {
-        std::env::var("HOME")
-            .map(|h| format!("{h}/Downloads:{h}/Desktop:{h}/macos-vm/shared"))
-            .unwrap_or_default()
-    });
-    let mut found = Vec::new();
-    for dir in dirs.split(':').filter(|d| !d.is_empty()) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
+    let env = std::env::var("IPASIDE_IPA_DIRS")
+        .or_else(|_| std::env::var("OPENSIDE_IPA_DIRS"))
+        .unwrap_or_default();
+    let dirs: Vec<String> = if env.is_empty() {
+        vec![
+            ".".to_string(),
+            format!("{}/Downloads", home_dir()),
+            format!("{}/Desktop", home_dir()),
+            format!("{}/Documents", home_dir()),
+        ]
+    } else {
+        env.split(':').filter(|d| !d.is_empty()).map(String::from).collect()
+    };
+    // BFS one level of subdirectories, like the engine (depth 2)
+    let mut found: Vec<(std::time::SystemTime, String)> = vec![];
+    let mut queue: Vec<(std::path::PathBuf, u8)> = dirs
+        .iter()
+        .map(|d| (std::path::PathBuf::from(d), 0))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    while let Some((dir, level)) = queue.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            let is_ipa = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("ipa"))
-                == Some(true);
-            if is_ipa {
-                found.push(path.to_string_lossy().into_owned());
+            let is_file = path.is_file();
+            if is_file && path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("ipa")) == Some(true) {
+                if let (Ok(key), Ok(meta)) = (path.canonicalize(), entry.metadata()) {
+                    if seen.insert(key) {
+                        found.push((meta.modified().unwrap_or(std::time::UNIX_EPOCH), path.to_string_lossy().into_owned()));
+                    }
+                }
+            } else if path.is_dir() && level < 2 {
+                queue.push((path, level + 1));
             }
         }
     }
-    found.sort();
-    found
+    found.sort_by(|a, b| b.0.cmp(&a.0)); // mais recente primeiro
+    found.into_iter().take(40).map(|(_, p)| p).collect()
+}
+
+fn home_dir() -> String {
+    std::env::var("HOME").unwrap_or_default()
 }
 
 // ---- render a JSON value as colored terminal lines ----
@@ -681,7 +704,7 @@ fn op_view(data: &Value) -> Vec<Line<'static>> {
     // {"ok":true,"uninstalled":"b"}
     if let Some(bundle) = data.get("uninstalled").and_then(Value::as_str) {
         return vec![Line::from(vec![
-            Span::styled("✓ ", st(GRN)),
+            Span::styled("  ✓ ", st(GRN)),
             Span::styled("uninstalled  ", st(GRAY)),
             Span::styled(bundle.to_string(), st(Color::White).add_modifier(Modifier::BOLD)),
         ])];
@@ -690,7 +713,7 @@ fn op_view(data: &Value) -> Vec<Line<'static>> {
     if let Some(path) = data.get("output").and_then(Value::as_str) {
         if data.get("status").and_then(Value::as_str) == Some("signed") {
             return vec![Line::from(vec![
-                Span::styled("✓ ", st(GRN)),
+                Span::styled("  ✓ ", st(GRN)),
                 Span::styled("assinado  ", st(GRAY)),
                 Span::styled(tidy_path(path), st(YEL).add_modifier(Modifier::BOLD)),
             ])];
@@ -701,7 +724,7 @@ fn op_view(data: &Value) -> Vec<Line<'static>> {
         if data.get("ok").and_then(Value::as_bool).is_some() {
             let ok = data.get("ok").and_then(Value::as_bool).unwrap_or(false);
             return vec![Line::from(vec![
-                Span::styled(if ok { "✓ " } else { "✗ " }, st(if ok { GRN } else { YEL })),
+                Span::styled(if ok { "  ✓ " } else { "  ✗ " }, st(if ok { GRN } else { YEL })),
                 Span::styled(
                     if ok { "restituído do registro  " } else { "não está no registro  " },
                     st(GRAY),
@@ -723,7 +746,7 @@ fn refresh_view(data: &Value) -> Vec<Line<'static>> {
         let bundle = r.get("bundle_id").and_then(Value::as_str).unwrap_or("?");
         match r.get("status").and_then(Value::as_str) {
             Some("installed") => out.push(Line::from(vec![
-                Span::styled("✓ ", st(GRN)),
+                Span::styled("  ✓ ", st(GRN)),
                 Span::styled(bundle.to_string(), st(Color::White)),
                 Span::styled(
                     match r.get("expires_at").and_then(Value::as_str) {
@@ -739,7 +762,7 @@ fn refresh_view(data: &Value) -> Vec<Line<'static>> {
                     .and_then(Value::as_str)
                     .unwrap_or("falhou (sem detalhe)");
                 out.push(Line::from(vec![
-                    Span::styled("✗ ", st(RED)),
+                    Span::styled("  ✗ ", st(RED)),
                     Span::styled(bundle.to_string(), st(Color::White)),
                     Span::styled(format!("  {err}"), st(GRAY)),
                 ]));
@@ -825,7 +848,7 @@ fn signed_view(data: &Value) -> Vec<Line<'static>> {
     if let Some(count) = count {
         let bytes = data.get("bytes").and_then(Value::as_u64);
         let mut out = vec![Line::from(vec![
-            Span::styled("● ", st(CY)),
+            Span::styled("  ● ", st(CY)),
             Span::styled(
                 format!("{count} ipa(s) · {}", mb(bytes)),
                 st(Color::White).add_modifier(Modifier::BOLD),
@@ -962,7 +985,7 @@ fn doctor_view(data: &Value) -> Vec<Line<'static>> {
                 _ => counts.0 += 1,
             }
             out.push(Line::from(vec![
-                Span::styled(format!("{mark} "), st(col)),
+                Span::styled(format!("  {mark} "), st(col)),
                 Span::styled(format!("{name:<22}"), st(Color::White)),
                 Span::styled(detail.to_string(), st(GRAY)),
             ]));
@@ -997,7 +1020,7 @@ fn devices_view(data: &Value) -> Vec<Line<'static>> {
             let label = if is_usb { "USB" } else { "WIFI" };
             let id = d.get("device_id").map(Value::to_string).unwrap_or_default();
             Line::from(vec![
-                Span::styled("● ", st(if is_usb { GRN } else { MAG })),
+                Span::styled("  ● ", st(if is_usb { GRN } else { MAG })),
                 Span::styled("iPhone", st(Color::White).add_modifier(Modifier::BOLD)),
                 Span::styled(format!(" {label} "), Style::new().fg(BG).bg(if is_usb { CY } else { MAG })),
                 Span::styled(format!(" …{tail}  id {id}"), st(GRAY)),
@@ -1045,7 +1068,7 @@ fn installs_view(data: &Value) -> Vec<Line<'static>> {
             } else {
                 ("? unknown".to_string(), GRAY, String::new())
             };
-            let mut spans = vec![Span::styled("● ", st(col))];
+            let mut spans = vec![Span::styled("  ● ", st(col))];
             if gauge.is_empty() {
                 // sem gauge: mantém a coluna do badge alinhada com as outras linhas
                 spans.push(Span::raw("           "));
@@ -1182,7 +1205,7 @@ fn relative_selection(from: usize, dir: i32, count: usize) -> usize {
 fn open_ipa_picker(app: &mut App, cmd: &'static str) {
     let found = ipa_candidates();
     if found.is_empty() {
-        app.note("no .ipa in OPENSIDE_IPA_DIRS (default Downloads/Desktop/macos-vm/shared)");
+        app.note("no .ipa in ~/Downloads, ~/Desktop, ~/Documents or cwd (set IPASIDE_IPA_DIRS to add dirs)");
     } else {
         app.dialog = Some(Dialog {
             title: format!("{cmd} which .ipa?"),
@@ -1367,29 +1390,34 @@ fn main() -> io::Result<()> {
             f.render_widget(Block::default().style(Style::new().bg(BG)), area);
 
             let rows = Layout::vertical([
-                Constraint::Length(6),
+                Constraint::Length(7),
                 Constraint::Length(2),
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
             .split(area);
-            // logo flush (2 linhas de gape abaixo antes do corpo)
+            // logo com 1 linha de respiro no topo; 2 linhas de gape antes do corpo
+            let head_row: [Rect; 2] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Length(6),
+            ])
+            .areas(rows[0]);
             let header =
-                Layout::horizontal([Constraint::Length(58), Constraint::Min(0)]).split(rows[0]);
+                Layout::horizontal([Constraint::Length(58), Constraint::Min(0)]).split(head_row[1]);
             let slot: [Rect; 3] = Layout::horizontal([
                 Constraint::Length(2),
                 Constraint::Length(56),
                 Constraint::Min(0),
             ])
-            .areas(rows[0]);
+            .areas(header[0]);
             f.render_widget(Paragraph::new(logo_lines("openside")), slot[1]);
             // badges centrados na altura do logo (sem linha de estado — o footer mostra)
             let bands: [Rect; 3] = Layout::vertical([
-                Constraint::Length(3),
+                Constraint::Length(4),
                 Constraint::Length(1),
                 Constraint::Min(0),
             ])
-            .areas(header[1]);
+            .areas(head_row[1]);
             let n_devices = connected(&app.devices);
             let mut chips = vec![
                 Span::styled("v0.1.0  ", st(GRAY)),
@@ -1465,10 +1493,13 @@ fn main() -> io::Result<()> {
             };
             let log_inner = box_title(f, body[1], &title, MAG);
             if panel_live {
+                let vis = log_inner.height.saturating_sub(1);
+                let scroll = real_scroll(app.panel.len(), vis, log_stored, log_bottom);
                 f.render_widget(
                     Paragraph::new(app.panel.clone())
                         .style(Style::new().bg(BG))
-                        .wrap(ratatui::widgets::Wrap { trim: false }),
+                        .wrap(ratatui::widgets::Wrap { trim: false })
+                        .scroll((scroll, 0)),
                     log_inner,
                 );
             } else {
@@ -1874,3 +1905,4 @@ mod tests {
         assert!(!tidy_value("caminho/normal.ipa").contains('…'), "caminho comum intacto");
     }
 }
+
