@@ -1417,7 +1417,7 @@ fn main() -> io::Result<()> {
                 Constraint::Length(1),
                 Constraint::Min(0),
             ])
-            .areas(head_row[1]);
+            .areas(header[1]);
             let n_devices = connected(&app.devices);
             let mut chips = vec![
                 Span::styled("v0.1.0  ", st(GRAY)),
@@ -1905,4 +1905,5 @@ mod tests {
         assert!(!tidy_value("caminho/normal.ipa").contains('…'), "caminho comum intacto");
     }
 }
+
 
