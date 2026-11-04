@@ -8,6 +8,7 @@ mod logo;
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -137,6 +138,72 @@ impl Drop for Engine {
     }
 }
 
+// ---- i18n: English everywhere, pt-BR via the language picker (first run) ----
+#[derive(Clone, Copy, PartialEq)]
+pub enum Lang {
+    En,
+    PtBr,
+}
+
+/// 0=unset (en until chosen), 1=en, 2=pt
+static LANG: AtomicU8 = AtomicU8::new(0);
+
+fn lang() -> Lang {
+    match LANG.load(Ordering::Relaxed) {
+        1 => Lang::En,
+        2 => Lang::PtBr,
+        _ => {
+            if cfg!(test) {
+                LANG.store(1, Ordering::Relaxed);
+                return Lang::En;
+            }
+            let l = read_saved_lang().unwrap_or(Lang::En);
+            LANG.store(match l {
+                Lang::En => 1,
+                Lang::PtBr => 2,
+            }, Ordering::Relaxed);
+            l
+        }
+    }
+}
+
+pub fn set_lang(l: Lang) {
+    LANG.store(match l {
+        Lang::En => 1,
+        Lang::PtBr => 2,
+    }, Ordering::Relaxed);
+    let _ = std::fs::create_dir_all(
+        std::path::Path::new(&home_dir()).join(".config/openside"),
+    );
+    let _ = std::fs::write(
+        std::path::Path::new(&home_dir()).join(".config/openside/language"),
+        match l {
+            Lang::En => "en",
+            Lang::PtBr => "ptbr",
+        },
+    );
+}
+
+fn read_saved_lang() -> Option<Lang> {
+    let raw = std::fs::read_to_string(
+        std::path::Path::new(&home_dir()).join(".config/openside/language"),
+    )
+    .ok()?;
+    match raw.trim() {
+        "ptbr" | "pt" => Some(Lang::PtBr),
+        "en" => Some(Lang::En),
+        _ => None,
+    }
+}
+
+/// translate: English by default, pt-BR after the picker
+fn t(en: &'static str, pt: &'static str) -> &'static str {
+    match lang() {
+        Lang::PtBr => pt,
+        Lang::En => en,
+    }
+}
+
 // ---- actions ----
 /// What happens when the user picks something in a dialog.
 enum Choice {
@@ -145,6 +212,8 @@ enum Choice {
     Forget(String),    // bundle id
     /// arbitrary `<cmd> <one-arg>` (inspect/sign .ipa)
     RunWith(String, String),
+    /// language picker on first run
+    SetLang(Lang),
 }
 
 enum DialogKind {
@@ -178,71 +247,55 @@ impl Item {
     }
 }
 
-/// aligned with MENU — one-line description shown under the list
-const MENU_DESC: &[&str] = &[
-    "getting started",
-    "engine self-check",
-    "connected iPhones",
-    "selected device details",
-    "sign in to an Apple ID",
-    "sideloading",
-    "sign + install an .ipa",
-    "sign an .ipa into a new file",
-    "sideloaded apps + expiry",
-    "re-sign apps expiring soon",
-    "re-sign one app by record",
-    "cached signed .ipas",
-    "apple id",
-    "development teams on the account",
-    "certs / app ids / devices slots",
-    "every signed-in Apple ID",
-    "device",
-    "show developer mode state",
-    "pairing file status",
-    "Dopamine advice",
-    "apps on the device",
-    "details for one device",
-    "ipa tooling",
-    "read an .ipa metadata",
-    "infrastructure",
-    "anisette provisioning status",
-    "Apple USB device-support status",
-    "remove a sideload record",
-    "remove a sideloaded app",
-    "engine build",
-];
+/// menu entries: (en, pt, en-desc, pt-desc, action)
+struct MenuEntry {
+    en: &'static str,
+    pt: &'static str,
+    den: &'static str,
+    dpt: &'static str,
+    item: Item,
+}
 
-const MENU: &[(&str, Item)] = &[
-    ("— getting started", Item::Header),
-    ("doctor", Item::Run("doctor")),
-    ("devices", Item::Run("devices")),
-    ("device-info", Item::Run("device-info")),
-    ("login apple id…", Item::Login),
-    ("— sideloading", Item::Header),
-    ("sideload an .ipa…", Item::PickIpa("sideload")),
-    ("sign an .ipa…", Item::PickIpa("sign")),
-    ("installs", Item::Run("installs")),
-    ("refresh expiring", Item::Run("refresh")),
-    ("refresh one app…", Item::PickApp(AppAction::RefreshOne)),
-    ("signed .ipas", Item::Run("signed")),
-    ("— apple id", Item::Header),
-    ("teams", Item::Run("teams")),
-    ("slots", Item::Run("slots")),
-    ("accounts", Item::Run("login --accounts")),
-    ("— device", Item::Header),
-    ("developer-mode", Item::Run("developer-mode")),
-    ("pairing", Item::Run("pairing")),
-    ("jailbreak", Item::Run("jailbreak")),
-    ("installed apps", Item::Run("apps")),
-    ("device-info", Item::Run("device-info")),
-    ("— ipa tooling", Item::Header),
-    ("inspect an .ipa…", Item::PickIpa("inspect")),
-    ("— infrastructure", Item::Header),
-    ("anisette status", Item::Run("anisette")),
-    ("apple-support", Item::Run("apple-support")),
-    ("forget an app…", Item::PickApp(AppAction::Forget)),
-    ("uninstall an app…", Item::PickApp(AppAction::Uninstall)),
-    ("version", Item::Run("version")),
+impl MenuEntry {
+    fn name(&self) -> &'static str {
+        if lang() == Lang::PtBr { self.pt } else { self.en }
+    }
+    fn desc(&self) -> &'static str {
+        if lang() == Lang::PtBr { self.dpt } else { self.den }
+    }
+}
+
+const MENU: &[MenuEntry] = &[
+    MenuEntry { en: "— getting started", pt: "— começar", den: "getting started", dpt: "primeiros passos", item: Item::Header },
+    MenuEntry { en: "doctor", pt: "diagnóstico", den: "engine self-check", dpt: "autoexame do engine", item: Item::Run("doctor") },
+    MenuEntry { en: "devices", pt: "aparelhos", den: "connected iPhones", dpt: "iPhones conectados", item: Item::Run("devices") },
+    MenuEntry { en: "device-info", pt: "info do aparelho", den: "selected device details", dpt: "detalhes do aparelho selecionado", item: Item::Run("device-info") },
+    MenuEntry { en: "login apple id…", pt: "entrar no Apple ID…", den: "sign in to an Apple ID", dpt: "entrar com um Apple ID", item: Item::Login },
+    MenuEntry { en: "— sideloading", pt: "— sideload", den: "sideloading", dpt: "sideload", item: Item::Header },
+    MenuEntry { en: "sideload an .ipa…", pt: "sideload de um .ipa…", den: "sign + install an .ipa", dpt: "assina + instala um .ipa", item: Item::PickIpa("sideload") },
+    MenuEntry { en: "sign an .ipa…", pt: "assinar um .ipa…", den: "sign an .ipa into a new file", dpt: "assina o .ipa num arquivo novo", item: Item::PickIpa("sign") },
+    MenuEntry { en: "installs", pt: "apps instalados", den: "sideloaded apps + expiry", dpt: "apps sideloadados + vencimento", item: Item::Run("installs") },
+    MenuEntry { en: "refresh expiring", pt: "renovar expirando", den: "re-sign apps expiring soon", dpt: "renova apps quase vencendo", item: Item::Run("refresh") },
+    MenuEntry { en: "refresh one app…", pt: "renovar um app…", den: "re-sign one app by record", dpt: "renova um app pelo registro", item: Item::PickApp(AppAction::RefreshOne) },
+    MenuEntry { en: "signed .ipas", pt: ".ipas assinados", den: "cached signed .ipas", dpt: ".ipas assinados em cache", item: Item::Run("signed") },
+    MenuEntry { en: "— apple id", pt: "— apple id", den: "apple id", dpt: "apple id", item: Item::Header },
+    MenuEntry { en: "teams", pt: "equipes", den: "development teams on the account", dpt: "equipes de dev da conta", item: Item::Run("teams") },
+    MenuEntry { en: "slots", pt: "slots", den: "certs / app ids / devices slots", dpt: "slots de certs / app ids / devices", item: Item::Run("slots") },
+    MenuEntry { en: "accounts", pt: "contas", den: "every signed-in Apple ID", dpt: "todas as contas conectadas", item: Item::Run("login --accounts") },
+    MenuEntry { en: "— device", pt: "— aparelho", den: "device", dpt: "aparelho", item: Item::Header },
+    MenuEntry { en: "developer-mode", pt: "modo dev", den: "show developer mode state", dpt: "estado do modo dev", item: Item::Run("developer-mode") },
+    MenuEntry { en: "pairing", pt: "pareamento", den: "pairing file status", dpt: "estado do arquivo de pareamento", item: Item::Run("pairing") },
+    MenuEntry { en: "jailbreak", pt: "jailbreak", den: "Dopamine advice", dpt: "dica de Dopamine", item: Item::Run("jailbreak") },
+    MenuEntry { en: "installed apps", pt: "apps instalados", den: "apps on the device", dpt: "apps no aparelho", item: Item::Run("apps") },
+    MenuEntry { en: "device-info", pt: "info do aparelho", den: "details for one device", dpt: "detalhes de um aparelho", item: Item::Run("device-info") },
+    MenuEntry { en: "— ipa tooling", pt: "— ferramentas .ipa", den: "ipa tooling", dpt: "ferramentas .ipa", item: Item::Header },
+    MenuEntry { en: "inspect an .ipa…", pt: "inspecionar um .ipa…", den: "read an .ipa metadata", dpt: "lê metadados do .ipa", item: Item::PickIpa("inspect") },
+    MenuEntry { en: "— infrastructure", pt: "— infraestrutura", den: "infrastructure", dpt: "infraestrutura", item: Item::Header },
+    MenuEntry { en: "anisette status", pt: "estado do anisette", den: "anisette provisioning status", dpt: "estado de provisioning do anisette", item: Item::Run("anisette") },
+    MenuEntry { en: "apple-support", pt: "apple-support", den: "Apple USB device-support status", dpt: "estado do device-support USB da Apple", item: Item::Run("apple-support") },
+    MenuEntry { en: "forget an app…", pt: "esquecer um app…", den: "remove a sideload record", dpt: "remove um registro de sideload", item: Item::PickApp(AppAction::Forget) },
+    MenuEntry { en: "uninstall an app…", pt: "desinstalar um app…", den: "remove a sideloaded app", dpt: "remove um app sideloadado", item: Item::PickApp(AppAction::Uninstall) },
+    MenuEntry { en: "version", pt: "versão", den: "engine build", dpt: "build do engine", item: Item::Run("version") },
 ];
 
 struct Dialog {
@@ -340,7 +393,7 @@ impl App {
         let id = self.next_id;
         self.last_cmd = args.first().cloned().unwrap_or_default();
         self.push(Line::from(Span::styled(
-            format!("» run {}", args.join(" ")),
+            format!("» {} {}", t("run", "rodar"), args.join(" ")),
             st(CY),
         )));
         STAGED.with(|s| {
@@ -355,7 +408,8 @@ impl App {
                     let _ = ENGINE_VERSION.set(v.to_string());
                 }
                 self.note(format!(
-                    "engine ready · v{}",
+                    "{} {}",
+                    t("engine ready ·", "engine pronto ·"),
                     frame.get("version").cloned().unwrap_or(Value::Null)
                 ));
             }
@@ -371,7 +425,7 @@ impl App {
                     command_view(&self.last_cmd, data)
                 } else {
                     let mut out = vec![Line::from(Span::styled(
-                        "✗ erro do engine",
+                        t("✗ engine error", "✗ erro do engine"),
                         st(RED).add_modifier(Modifier::BOLD),
                     ))];
                     out.extend(render_value(err, 0));
@@ -385,7 +439,7 @@ impl App {
                         if let Some(dialog) = picker {
                             self.dialog = Some(dialog);
                         } else {
-                            self.note("no sideloaded apps recorded");
+                            self.note(t("no sideloaded apps recorded", "nenhum app sideloadado no registro"));
                         }
                     }
                 }
@@ -412,9 +466,9 @@ impl App {
                         .unwrap_or("ok");
                     if ok && status == "2fa_required" && self.login.is_some() {
                         self.dialog = Some(Dialog {
-                            title: "2FA code:".into(),
+                            title: t("2FA code:", "código 2FA:").into(),
                             kind: DialogKind::Input {
-                                prompt: "2FA code:".into(),
+                                prompt: t("2FA code:", "código 2FA:").into(),
                                 masked: true,
                                 buffer: String::new(),
                             },
@@ -431,7 +485,7 @@ impl App {
                     let data = frame.get("data").cloned().unwrap_or(Value::Null);
                     let count = data.as_array().map(|a| a.len()).unwrap_or(0);
                     self.devices = Some(data);
-                    self.push(Line::from(format!("devices changed — {count} connected")));
+                    self.push(Line::from(format!("{} {} — {} {}", t("devices", "aparelhos"), t("changed", "mudou"), count, t("connected", "conectado(s)"))));
                 }
             }
             Some("stderr") => {
@@ -446,7 +500,12 @@ impl App {
             _ => {
                 // raw frame is machine data: only the kind goes to the ticker
                 let kind = frame.get("type").and_then(Value::as_str).unwrap_or("?");
-                self.note(format!("frame {kind} ignorado"));
+                self.note(format!(
+                    "{} {} {}",
+                    t("frame", "frame"),
+                    kind,
+                    t("ignored", "ignorado")
+                ));
             }
         }
     }
@@ -473,7 +532,7 @@ fn app_picker(data: &Value, make_choice: fn(String) -> Choice) -> Option<Dialog>
         return None;
     }
     Some(Dialog {
-        title: "which app?".into(),
+        title: t("which app?", "qual app?").into(),
         kind: DialogKind::Pick { items, sel: 0 },
     })
 }
@@ -605,7 +664,7 @@ fn command_view(cmd: &str, data: &Value) -> Vec<Line<'static>> {
             };
             vec![
                 Line::from(Span::styled(
-                    format!(" openside v{} ", env!("CARGO_PKG_VERSION")),
+                    format!(" openside {} ", env!("CARGO_PKG_VERSION")),
                     Style::new().fg(BG).bg(MAG).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
@@ -705,7 +764,7 @@ fn op_view(data: &Value) -> Vec<Line<'static>> {
     if let Some(bundle) = data.get("uninstalled").and_then(Value::as_str) {
         return vec![Line::from(vec![
             Span::styled("  ✓ ", st(GRN)),
-            Span::styled("uninstalled  ", st(GRAY)),
+            Span::styled(format!("{} ", t("uninstalled", "desinstalado")), st(GRAY)),
             Span::styled(bundle.to_string(), st(Color::White).add_modifier(Modifier::BOLD)),
         ])];
     }
@@ -714,7 +773,7 @@ fn op_view(data: &Value) -> Vec<Line<'static>> {
         if data.get("status").and_then(Value::as_str) == Some("signed") {
             return vec![Line::from(vec![
                 Span::styled("  ✓ ", st(GRN)),
-                Span::styled("assinado  ", st(GRAY)),
+                Span::styled(format!("{} ", t("signed", "assinado")), st(GRAY)),
                 Span::styled(tidy_path(path), st(YEL).add_modifier(Modifier::BOLD)),
             ])];
         }
@@ -726,7 +785,7 @@ fn op_view(data: &Value) -> Vec<Line<'static>> {
             return vec![Line::from(vec![
                 Span::styled(if ok { "  ✓ " } else { "  ✗ " }, st(if ok { GRN } else { YEL })),
                 Span::styled(
-                    if ok { "restituído do registro  " } else { "não está no registro  " },
+                    if ok { format!("{} ", t("removed from registry", "removido do registro")) } else { format!("{} ", t("not in the registry", "não está no registro")) },
                     st(GRAY),
                 ),
                 Span::styled(bundle.to_string(), st(Color::White)),
@@ -750,7 +809,7 @@ fn refresh_view(data: &Value) -> Vec<Line<'static>> {
                 Span::styled(bundle.to_string(), st(Color::White)),
                 Span::styled(
                     match r.get("expires_at").and_then(Value::as_str) {
-                        Some(at) if !at.is_empty() => format!("  expira {at}"),
+                        Some(at) if !at.is_empty() => format!("  {} {at}", t("expires", "expira")),
                         _ => String::new(),
                     },
                     st(GRAY),
@@ -760,7 +819,7 @@ fn refresh_view(data: &Value) -> Vec<Line<'static>> {
                 let err = r
                     .get("error")
                     .and_then(Value::as_str)
-                    .unwrap_or("falhou (sem detalhe)");
+                    .unwrap_or(t("failed (no detail)", "falhou (sem detalhe)"));
                 out.push(Line::from(vec![
                     Span::styled("  ✗ ", st(RED)),
                     Span::styled(bundle.to_string(), st(Color::White)),
@@ -773,7 +832,7 @@ fn refresh_view(data: &Value) -> Vec<Line<'static>> {
         out.push(Line::from(Span::styled(format!("  {n} app(s)"), st(GRAY))));
     }
     if out.is_empty() {
-        return vec![Line::from(Span::styled("· nothing to refresh", st(GRAY)))];
+        return vec![Line::from(Span::styled(t("· nothing to refresh", "· nada pra renovar"), st(GRAY)))];
     }
     out
 }
@@ -820,7 +879,7 @@ fn anisette_view(data: &Value) -> Vec<Line<'static>> {
                     st(CY),
                 ),
                 Span::styled(
-                    if cached { "  · state em cache" } else { "  · sem state em cache" },
+                    if cached { format!("  · {}", t("state cached", "state em cache")) } else { format!("  · {}", t("no cached state", "sem state em cache")) },
                     st(GRAY),
                 ),
             ])];
@@ -831,7 +890,7 @@ fn anisette_view(data: &Value) -> Vec<Line<'static>> {
                         .map(|s| s.as_str().unwrap_or("?").to_string())
                         .collect();
                     out.push(Line::from(Span::styled(
-                        format!("  {} server(s): {}", list.len(), names.join(", ")),
+                        format!("  {} {}: {}", list.len(), t("server(s)", "servidor(es)"), names.join(", ")),
                         st(GRAY),
                     )));
                 }
@@ -927,7 +986,7 @@ fn login_status_view(data: &Value) -> Vec<Line<'static>> {
             .unwrap_or("unknown");
         return vec![Line::from(vec![
             Span::styled(if authed { "✓ " } else { "✗ " }, st(if authed { GRN } else { RED })),
-            Span::styled("signed in: ", st(GRAY)),
+            Span::styled(format!("{} ", t("signed in:", "sessão ativa:")), st(GRAY)),
             Span::styled(email.to_string(), st(Color::White).add_modifier(Modifier::BOLD)),
         ])];
     }
@@ -940,7 +999,7 @@ fn login_status_view(data: &Value) -> Vec<Line<'static>> {
             out.push(Line::from(vec![
                 Span::styled(if active { "● " } else { "○ " }, st(if active { GRN } else { GRAY })),
                 Span::styled(format!("{email:<34}"), st(Color::White)),
-                Span::styled(format!("team {team}"), st(GRAY)),
+                Span::styled(format!("{} {team}", t("team", "equipe")), st(GRAY)),
             ]));
         }
         out.push(Line::from(Span::styled(
@@ -1007,7 +1066,7 @@ fn devices_view(data: &Value) -> Vec<Line<'static>> {
     };
     if list.is_empty() {
         return vec![Line::from(Span::styled(
-            "○ no iPhone connected — plug in via USB, unlock, tap Trust",
+            t("○ no iPhone connected — plug in via USB, unlock, tap Trust", "○ nenhum iPhone conectado — plugue via USB, desbloqueie e toque em Confiar"),
             st(GRAY),
         ))];
     }
@@ -1035,7 +1094,7 @@ fn installs_view(data: &Value) -> Vec<Line<'static>> {
     };
     if list.is_empty() {
         return vec![Line::from(Span::styled(
-            "· nothing sideloaded yet",
+            t("· nothing sideloaded yet", "· nada sideloadado ainda"),
             st(GRAY),
         ))];
     }
@@ -1061,12 +1120,12 @@ fn installs_view(data: &Value) -> Vec<Line<'static>> {
             let expired = r.get("expired").and_then(Value::as_bool).unwrap_or(false);
             let days = r.get("days_left").and_then(Value::as_f64);
             let (badge, col, gauge) = if expired {
-                ("✗ expired".to_string(), RED, String::new())
+                (format!("{}", t("✗ expired", "✗ vencido")), RED, String::new())
             } else if let Some(d) = days {
                 let (g, gcol) = bar_text(d);
-                (format!("{d:.0}d left"), gcol, g)
+                (format!("{d:.0}{}", t("d left", " d restantes")), gcol, g)
             } else {
-                ("? unknown".to_string(), GRAY, String::new())
+                (format!("? {}", t("unknown", "desconhecido")), GRAY, String::new())
             };
             let mut spans = vec![Span::styled("  ● ", st(col))];
             if gauge.is_empty() {
@@ -1083,12 +1142,13 @@ fn installs_view(data: &Value) -> Vec<Line<'static>> {
         })
         .chain(std::iter::once(Line::from(Span::styled(
             format!(
-                "  {} app{} · {} expired",
+                "  {} app{} · {} {}",
                 list.len(),
                 if list.len() == 1 { "" } else { "s" },
                 list.iter()
                     .filter(|r| r.get("expired").and_then(Value::as_bool).unwrap_or(false))
-                    .count()
+                    .count(),
+                t("expired", "vencido(s)"),
             ),
             st(GRAY),
         ))))
@@ -1189,13 +1249,13 @@ fn relative_selection(from: usize, dir: i32, count: usize) -> usize {
         } else {
             i = (i + 1).min(count - 1);
         }
-        if dir < 0 && i == 0 && !MENU[0].1.selectable() {
+        if dir < 0 && i == 0 && !MENU[0].item.selectable() {
             return i;
         }
-        if MENU[i].1.selectable() {
+        if MENU[i].item.selectable() {
             return i;
         }
-        if i == 0 || (dir > 0 && i == count - 1 && !MENU[i].1.selectable()) {
+        if i == 0 || (dir > 0 && i == count - 1 && !MENU[i].item.selectable()) {
             return from;
         }
     }
@@ -1205,10 +1265,10 @@ fn relative_selection(from: usize, dir: i32, count: usize) -> usize {
 fn open_ipa_picker(app: &mut App, cmd: &'static str) {
     let found = ipa_candidates();
     if found.is_empty() {
-        app.note("no .ipa in ~/Downloads, ~/Desktop, ~/Documents or cwd (set IPASIDE_IPA_DIRS to add dirs)");
+        app.note(t("no .ipa in ~/Downloads, ~/Desktop, ~/Documents or cwd (set IPASIDE_IPA_DIRS to add dirs)", "sem .ipa em ~/Downloads, ~/Desktop, ~/Documents ou cwd (defina IPASIDE_IPA_DIRS para mais pastas)"));
     } else {
         app.dialog = Some(Dialog {
-            title: format!("{cmd} which .ipa?"),
+            title: format!("{} {} {cmd}?", t("which .ipa", "qual .ipa"), t("for", "para")),
             kind: DialogKind::Pick {
                 items: found
                     .into_iter()
@@ -1231,11 +1291,17 @@ fn connected(devices: &Option<Value>) -> usize {
         .unwrap_or(0)
 }
 
-const FOOT: &str = " ↑↓/click pick · click again or ⏎ run · esc quit ";
+fn foot() -> String {
+    format!(
+        " {}",
+        t("↑↓/click pick · click again or ⏎ run · esc quit ",
+          "↑↓/clique escolhe · clique de novo ou ⏎ roda · esc sai ")
+    )
+}
 
 /// run the currently selected menu entry (key ⏎ or second click)
 fn activate_menu(app: &mut App) {
-    match &MENU[app.selection].1 {
+    match &MENU[app.selection].item {
         Item::Run(cmd) => {
             let parts: Vec<String> = cmd.split_whitespace().map(String::from).collect();
             app.run(parts);
@@ -1343,6 +1409,10 @@ fn confirm_dialog(app: &mut App) {
                 Some((_, Choice::Uninstall(bundle))) => app.run(vec!["uninstall".into(), bundle]),
                 Some((_, Choice::Refresh(bundle))) => app.run(vec!["refresh".into(), bundle]),
                 Some((_, Choice::Forget(bundle))) => app.run(vec!["forget".into(), bundle]),
+                Some((_, Choice::SetLang(l))) => {
+                    set_lang(l);
+                    app.note(t("language set", "idioma definido"));
+                }
                 _ => {}
             },
             _ => {}
@@ -1360,6 +1430,19 @@ fn main() -> io::Result<()> {
         }
     };
     let mut app = App::new();
+    // language picker on the first run — reads ~/.config/openside/language
+    if read_saved_lang().is_none() {
+        app.dialog = Some(Dialog {
+            title: "language / idioma".into(),
+            kind: DialogKind::Pick {
+                items: vec![
+                    ("English".to_string(), Choice::SetLang(Lang::En)),
+                    ("Português (BR)".to_string(), Choice::SetLang(Lang::PtBr)),
+                ],
+                sel: 0,
+            },
+        });
+    }
     let mut log_bottom = true; // stick to the tail until the user scrolls
     let mut log_stored: u16 = 0;
     let mut last_click: Option<(u16, u16)> = None;
@@ -1391,12 +1474,12 @@ fn main() -> io::Result<()> {
 
             let rows = Layout::vertical([
                 Constraint::Length(7),
-                Constraint::Length(2),
+                Constraint::Length(1),
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
             .split(area);
-            // logo com 1 linha de respiro no topo; 2 linhas de gape antes do corpo
+            // logo com 1 linha de respiro no topo; 1 linha de gape antes do corpo
             let head_row: [Rect; 2] = Layout::vertical([
                 Constraint::Length(1),
                 Constraint::Length(6),
@@ -1428,14 +1511,14 @@ fn main() -> io::Result<()> {
             ];
             if app.expired > 0 {
                 chips.push(Span::styled(
-                    format!(" ! {expired} expired ", expired = app.expired),
+                    format!(" ! {n} {word} ", n = app.expired, word = t("expired", "vencidos")),
                     Style::new().fg(Color::White).bg(RED),
                 ));
                 chips.push(Span::raw(" "));
             }
             if app.expiring > 0 {
                 chips.push(Span::styled(
-                    format!(" ⚠ {exp} expiring ", exp = app.expiring),
+                    format!(" ⚠ {exp} {tail} ", exp = app.expiring, tail = t("expiring", "vencendo")),
                     Style::new().fg(DARK).bg(YEL),
                 ));
                 chips.push(Span::raw(" "));
@@ -1455,18 +1538,18 @@ fn main() -> io::Result<()> {
                 .split(rows[2]);
             let menu_cols: [Rect; 2] =
                 Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(
-                    box_title(f, body[0], "commands", CY),
+                    box_title(f, body[0], t("commands", "comandos"), CY),
                 );
             hit_menu_list = menu_cols[0];
             let mut list = ListState::default();
-            if MENU[app.selection].1.selectable() {
+            if MENU[app.selection].item.selectable() {
                 list.select(Some(app.selection));
             }
             let items = MENU
                 .iter()
-                .map(|(name, item)| match item {
-                    Item::Header => format!("  {name}"),
-                    _ => format!(" ▪ {name}"),
+                .map(|e| match e.item {
+                    Item::Header => format!("  {}", e.name()),
+                    _ => format!(" ▪ {}", e.name()),
                 })
                 .collect::<Vec<String>>();
             f.render_stateful_widget(
@@ -1478,7 +1561,7 @@ fn main() -> io::Result<()> {
             );
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    format!(" {} ", MENU_DESC[app.selection]),
+                    format!(" {} ", MENU[app.selection].desc()),
                     st(GRAY).add_modifier(Modifier::DIM),
                 )))
                 .style(Style::new().bg(BG)),
@@ -1487,9 +1570,9 @@ fn main() -> io::Result<()> {
 
             let panel_live = !app.panel.is_empty();
             let title = if panel_live {
-                format!("{} ", if app.last_cmd.is_empty() { "output" } else { &app.last_cmd })
+                format!("{} ", if app.last_cmd.is_empty() { t("output", "saída") } else { &app.last_cmd })
             } else {
-                format!("ticker — {} lines", app.log.len())
+                format!("{} — {} {}", t("ticker", "ticker"), app.log.len(), t("lines", "linhas"))
             };
             let log_inner = box_title(f, body[1], &title, MAG);
             if panel_live {
@@ -1519,14 +1602,19 @@ fn main() -> io::Result<()> {
                 rows[3],
             );
             f.render_widget(
-                Paragraph::new(Line::from(Span::styled(FOOT, st(GRAY))))
+                Paragraph::new(Line::from(Span::styled(foot(), st(GRAY))))
                     .style(Style::new().bg(DARK)),
                 rows[3],
             );
             let status_text = match (&app.spinner, &app.app_action) {
                 (Some(line), _) => format!("{line}… "),
-                (_, Some(_)) => "fetching app list… ".to_string(),
-                _ => format!("ready · {} connected", connected(&app.devices)),
+                (_, Some(_)) => t("fetching app list… ", "buscando lista de apps… ").to_string(),
+                _ => format!(
+                    "{} · {} {}",
+                    t("ready", "pronto"),
+                    connected(&app.devices),
+                    t("connected", "conectado(s)"),
+                ),
             };
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
@@ -1838,7 +1926,7 @@ mod tests {
     #[test]
     fn version_panel_and_login_accounts() {
         let v = command_view("version", &serde_json::json!({"version":"1.2.10"}));
-        assert!(v[0].spans[0].content.contains("openside v0.1.0"));
+        assert!(v[0].spans[0].content.contains("openside 0.1.0"));
         assert!(v[1].spans[0].content.contains("engine 1.2.10"));
         let acc = command_view("login", &serde_json::json!({"accounts":[{"email":"a@b","team_id":"T1","active":true}]}));
         assert!(acc[0].spans[0].content.contains("●"));
@@ -1876,7 +1964,7 @@ mod tests {
         let u = command_view("uninstall", &json!({"ok":true,"uninstalled":"x.app"}));
         assert!(u[0].spans[2].content.contains("x.app"));
         let forget = command_view("forget", &json!({"ok":false,"bundle_id":"x.app"}));
-        assert!(forget[0].spans[1].content.contains("não está no registro"));
+        assert!(forget[0].spans[1].content.contains("not in the registry"));
     }
 
     #[test]
