@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/schnnjuan/openside/openside/docs/brand/openside.svg" alt="openside" width="352">
+<img src="https://raw.githubusercontent.com/schnnjuan/openside/openside/docs/brand/openside.svg" alt="openside" width="440">
 
 # openside
 
