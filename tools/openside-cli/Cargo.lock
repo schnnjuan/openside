@@ -764,7 +764,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "openside-cli"
+name = "openside"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",

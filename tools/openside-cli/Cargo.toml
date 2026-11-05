@@ -1,10 +1,10 @@
 [package]
-name = "openside-cli"
+name = "openside"
 version = "0.1.0"
 edition = "2021"
-description = "Terminal front-end for the OpenSide engine (Python side, Rust TUI)."
+description = "A polished ratatui terminal interface for sideloading .ipas to your iPhone — ls/cd .ipa browser, expiry tracking, full English/pt-BR interface."
 license = "MIT"
-repository = "https://github.com/pwnapplehat/OpenSide"
+repository = "https://github.com/schnnjuan/openside"
 readme = "README.md"
 
 [dependencies]
