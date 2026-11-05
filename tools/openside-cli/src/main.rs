@@ -1633,65 +1633,6 @@ fn main() -> io::Result<()> {
             ])
             .areas(header[0]);
             f.render_widget(Paragraph::new(logo_lines("openside")), slot[1]);
-            // badges centrados na altura do logo (sem linha de estado — o footer mostra)
-            let bands: [Rect; 3] = Layout::vertical([
-                Constraint::Length(4),
-                Constraint::Length(1),
-                Constraint::Min(0),
-            ])
-            .areas(header[1]);
-            let n_devices = connected(&app.devices);
-            let engine_chip = format!(
-                " engine {} ",
-                ENGINE_VERSION.get().map(String::as_str).unwrap_or("…")
-            );
-            let version_chip = format!(
-                "{:^width$}",
-                "0.1.0",
-                width = engine_chip.len().max(" 0.1.0 ".len())
-            );
-            let mut chips = vec![
-                Span::styled(
-                    version_chip,
-                    Style::new().fg(BG).bg(MAG).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-                Span::styled(" anx set ", Style::new().fg(DARK).bg(GRAY)),
-                Span::raw(" "),
-                Span::styled(
-                    engine_chip.clone(),
-                    Style::new()
-                        .fg(BG)
-                        .bg(CY)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-            ];
-            if app.expired > 0 {
-                chips.push(Span::styled(
-                    format!(" ! {n} {word} ", n = app.expired, word = t("expired", "vencidos")),
-                    Style::new().fg(Color::White).bg(RED),
-                ));
-                chips.push(Span::raw(" "));
-            }
-            if app.expiring > 0 {
-                chips.push(Span::styled(
-                    format!(" ⚠ {exp} {tail} ", exp = app.expiring, tail = t("expiring", "vencendo")),
-                    Style::new().fg(DARK).bg(YEL),
-                ));
-                chips.push(Span::raw(" "));
-            }
-            chips.push(Span::styled(
-                format!(" {dot} {n_devices} device{plural} ", dot = if n_devices > 0 { "●" } else { "○" }, plural = if n_devices == 1 { "" } else { "s" }),
-                Style::new().fg(BG).bg(if n_devices > 0 { GRN } else { GRAY }),
-            ));
-            f.render_widget(
-                Paragraph::new(Line::from(chips))
-                    .alignment(ratatui::layout::Alignment::Right)
-                    .style(Style::new().bg(BG)),
-                bands[1],
-            );
-
             let body = Layout::horizontal([Constraint::Length(32), Constraint::Min(0)])
                 .split(rows[2]);
             let menu_cols: [Rect; 2] =
