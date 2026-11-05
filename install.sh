@@ -116,14 +116,19 @@ def grad(t):
     a,b=STOPS[seg],STOPS[seg+1]
     return tuple(round(x+(y-x)*f) for x,y in zip(a,b))
 word="openside"; SLOT=12
-W=len(word)*6+len(word)-1
-grid=[[0]*W for _ in range(SLOT)]
-x=0
+def ink_span(g):
+    ink=[c for row in g for c,ch in enumerate(row) if ch=="#"]
+    return (min(ink), max(ink))
+xs=[]; x=0
 for c in word:
+    f,l=ink_span(G[c])
+    x=max(0,x-f); xs.append(x); x+=l+2
+W=x-1
+grid=[[0]*W for _ in range(SLOT)]
+for c,xx in zip(word,xs):
     for ry,row in enumerate(G[c]):
         for cx,ch in enumerate(row):
-            if ch=="#": grid[ry][x+cx]=1
-    x+=7
+            if ch=="#": grid[ry][xx+cx]=1
 for y in range(SLOT):
     c=grad(y/(SLOT-1))
     line="".join((f"{E}[38;2;{c[0]};{c[1]};{c[2]}m█" if p else " ") for p in grid[y])
