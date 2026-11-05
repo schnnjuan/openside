@@ -217,13 +217,18 @@ enum Choice {
 enum DialogKind {
     Pick { items: Vec<(String, Choice)>, sel: usize },
     Input { prompt: String, masked: bool, buffer: String },
-    /// ls/cd file browser for .ipa files: cwd + subdirs + *.ipa rows
+    /// ls/cd file browser for .ipa files: pwd row + listing + mini command
+    /// line (ls · cd <dir> · direct .ipa path)
     Browse {
         path: String,
         /// (name, is_dir); files are .ipa only
         entries: Vec<(String, bool)>,
-        /// 0 = parent (..), then entries, last = "type path" row
+        /// 0 = parent (..), then entries
         sel: usize,
+        /// mini command line (ls / cd / direct path); empty = confirm sel
+        cmd: String,
+        /// last command-line error (shown in red under the bar)
+        err: Option<String>,
     },
 }
 
@@ -604,7 +609,13 @@ fn browse_dialog(path: String, title: String) -> Dialog {
     let entries = list_dir_items(&path);
     Dialog {
         title,
-        kind: DialogKind::Browse { path, entries, sel: 0 },
+        kind: DialogKind::Browse {
+            path,
+            entries,
+            sel: 0,
+            cmd: String::new(),
+            err: None,
+        },
     }
 }
 
@@ -638,10 +649,8 @@ fn browse_confirm(app: &mut App) {
         Some(Dialog { kind: DialogKind::Browse { path, .. }, .. }) => path.clone(),
         _ => return,
     };
-    let (entries, sel) = match &app.dialog {
-        Some(Dialog { kind: DialogKind::Browse { entries, sel, .. }, .. }) => {
-            (entries.len(), *sel)
-        }
+    let sel = match &app.dialog {
+        Some(Dialog { kind: DialogKind::Browse { sel, .. }, .. }) => *sel,
         _ => return,
     };
     let title = app.dialog.as_ref().map(|d| d.title.clone()).unwrap_or_default();
@@ -655,50 +664,35 @@ fn browse_confirm(app: &mut App) {
             }
         }
         app.dialog = Some(browse_dialog(path, title));
-    } else if sel > entries {
-        // "type path" row
-        app.dialog = Some(Dialog {
-            title: t(".ipa path:", "caminho do .ipa:").to_string(),
-            kind: DialogKind::Input {
-                prompt: t("direct path to the .ipa:", "caminho direto do .ipa:").to_string(),
-                masked: false,
-                buffer: String::new(),
-            },
-        });
     } else {
         let (name, is_dir) = entries_vec(app, sel);
         if is_dir {
             let child = format!("{path}/{name}");
             app.dialog = Some(browse_dialog(child, title));
-        } else if let Some(cmd) = app.ipa_cmd.take() {
+        } else if let Some(cmd_paid) = app.ipa_cmd.take() {
             app.dialog = None;
-            app.run(vec![cmd.to_string(), format!("{path}/{name}")]);
+            app.run(vec![cmd_paid.to_string(), format!("{path}/{name}")]);
         }
     }
 }
 
 /// pull the selected entry out of the open Browse dialog
 fn entries_vec(app: &mut App, sel: usize) -> (String, bool) {
-    let out = (
-        String::new(),
-        false,
-    );
     if let Some(Dialog { kind: DialogKind::Browse { entries, .. }, .. }) = app.dialog.as_mut() {
         if let Some((name, is_dir)) = entries.get(sel - 1) {
             return (name.clone(), *is_dir);
         }
     }
-    out
+    (String::new(), false)
 }
 
-/// Escape/Backspace in the browser: one level up
+/// one level up in the browser (Backspace on an empty bar)
 fn browse_up(app: &mut App) {
-    let (path, title) = match app.dialog.take() {
-        Some(Dialog {
-            title,
-            kind: DialogKind::Browse { path, .. },
-        }) => (path, title),
-        _ => return,
+    let Some(Dialog { title, kind }) = app.dialog.take() else {
+        return;
+    };
+    let DialogKind::Browse { path, .. } = kind else {
+        return;
     };
     if let Some(parent) = std::path::Path::new(&path).parent() {
         let parent = parent.to_string_lossy().into_owned();
@@ -708,6 +702,96 @@ fn browse_up(app: &mut App) {
         }
     }
     app.dialog = Some(browse_dialog(path, title));
+}
+
+/// `~`/relative/absolute — the browser's own cwd is the base
+fn resolve_path(base: &str, input: &str) -> String {
+    let home = home_dir();
+    if input == "~" {
+        return home;
+    }
+    if let Some(rest) = input.strip_prefix("~/") {
+        return format!("{home}/{rest}");
+    }
+    if input.starts_with('/') {
+        return input.to_string();
+    }
+    format!("{base}/{input}")
+}
+
+/// pwd row display: home prefix → ~
+fn display_path(path: &str) -> String {
+    let home = home_dir();
+    path.strip_prefix(&home)
+        .map(|rest| format!("~{rest}"))
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// Enter on the mini command line: ls / cd <dir> / direct .ipa path.
+/// Dialog rebuilt on every command (fresh listing, cmd cleared).
+fn browse_exec(app: &mut App) {
+    let Some(Dialog { title, kind }) = app.dialog.take() else {
+        return;
+    };
+    let DialogKind::Browse { path, entries, sel, cmd, err } = kind else {
+        return;
+    };
+    let canon = |p: &str| -> String {
+        std::fs::canonicalize(p)
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let input = cmd.trim().to_string();
+    let mut reopen = |kind: DialogKind| {
+        app.dialog = Some(Dialog { title: title.clone(), kind });
+    };
+    if input.is_empty() {
+        reopen(DialogKind::Browse { path, entries, sel, cmd: String::new(), err });
+        browse_confirm(app);
+        return;
+    }
+    if input == "ls" {
+        reopen(DialogKind::Browse {
+            path: path.clone(),
+            entries: list_dir_items(&path),
+            sel,
+            cmd: String::new(),
+            err: None,
+        });
+        return;
+    }
+    if input == "cd" {
+        // bare cd = home
+        reopen(browse_dialog(home_dir(), title.clone()).kind);
+        return;
+    }
+    if let Some(arg) = input.strip_prefix("cd ") {
+        let target = resolve_path(&path, arg);
+        if std::path::Path::new(&target).is_dir() {
+            reopen(browse_dialog(canon(&target), title.clone()).kind);
+            return;
+        }
+        let err = Some(t("no such directory", "pasta não existe").to_string());
+        reopen(DialogKind::Browse { path, entries, sel, cmd, err });
+        return;
+    }
+    // direct path: .ipa file → run; dir → cd-in
+    let target = resolve_path(&path, &input);
+    if let Ok(fine) = std::fs::canonicalize(&target) {
+        if fine.is_file() && input.ends_with(".ipa") {
+            if let Some(cmd_paid) = app.ipa_cmd.take() {
+                app.dialog = None;
+                app.run(vec![cmd_paid.to_string(), fine.to_string_lossy().into_owned()]);
+                return;
+            }
+        }
+        if fine.is_dir() {
+            reopen(browse_dialog(fine.to_string_lossy().into_owned(), title.clone()).kind);
+            return;
+        }
+    }
+    let err = Some(t("no such path", "caminho não existe").to_string());
+    reopen(DialogKind::Browse { path, entries, sel, cmd, err });
 }
 
 fn home_dir() -> String {
@@ -1473,18 +1557,6 @@ fn submit_input(app: &mut App, buffer: String) {
     if value.is_empty() {
         return;
     }
-    // direct .ipa path typed from the browse dialog's last row
-    if stage.contains(".ipa") {
-        let Some(cmd) = app.ipa_cmd.take() else {
-            return;
-        };
-        if std::path::Path::new(&value).exists() {
-            app.run(vec![cmd.to_string(), value]);
-        } else {
-            app.note(t("path not found", "caminho não existe"));
-        }
-        return;
-    }
     // e-mail step: no wizard flow yet (title text can't drive the flow —
     // it's translated)
     if app.login.is_none() {
@@ -1606,6 +1678,7 @@ fn main() -> io::Result<()> {
 
         let mut hit_menu_list = Rect::default();
         let mut hit_dialog_list = Rect::default();
+        let mut hit_dialog_box = Rect::default();
         let mut hit_lang_btn = Rect::default();
         terminal.draw(|f| {
             let area = f.area();
@@ -1770,27 +1843,70 @@ fn main() -> io::Result<()> {
                                 labels.push(name.clone());
                             }
                         }
-                        labels.push(
-                            t("… type the path", "… digitar caminho").to_string(),
-                        );
-                        Some((labels, *sel, entries.len() + 2))
+                        Some((labels, *sel, entries.len() + 1))
                     }
                     _ => None,
                 };
                 if let Some((labels, sel_now, count)) = list.as_ref() {
-                    let width = (57.min(area.width.saturating_sub(4))).max(20);
-                    let height = (*count as u16 + 5).min(rows[2].height.saturating_sub(2));
+                    let width = (61.min(area.width.saturating_sub(4))).max(24);
+                    // browse: +3 fixed rows (pwd / mini cmd line / err)
+                    let extra = if let DialogKind::Browse { .. } = &dlog.kind { 3 } else { 0 };
+                    let height = (*count as u16 + 5 + extra).min(rows[2].height.saturating_sub(2));
                     let x = area.x + (area.width.saturating_sub(width)) / 2;
                     let y = rows[2].y + (rows[2].height.saturating_sub(height)) / 2;
-                    let inner = box_title(f, Rect { x, y, width, height }, &dlog.title, YEL);
-                    hit_dialog_list = inner;
+                    let outer = Rect { x, y, width, height };
+                    let inner = box_title(f, outer, &dlog.title, YEL);
+                    hit_dialog_box = outer;
+                    let list_area = if let DialogKind::Browse { path, cmd, err, .. } = &dlog.kind {
+                        let dims: [Rect; 4] = Layout::vertical([
+                            Constraint::Length(1),
+                            Constraint::Min(0),
+                            Constraint::Length(1),
+                            Constraint::Length(1),
+                        ])
+                        .areas(inner);
+                        // pwd row: home prefix → ~
+                        f.render_widget(
+                            Paragraph::new(Line::from(Span::styled(
+                                format!(" ❯ {}", display_path(path)),
+                                st(GRAY),
+                            ))),
+                            dims[0],
+                        );
+                        // mini command line: placeholder (gray) or typed text
+                        let bar = if cmd.is_empty() {
+                            Line::from(Span::styled(
+                                format!(
+                                    " ❯ {}",
+                                    t("(ls · cd <dir> · .ipa path)", "(ls · cd <pasta> · caminho do .ipa)")
+                                ),
+                                st(GRAY).add_modifier(Modifier::DIM),
+                            ))
+                        } else {
+                            Line::from(Span::styled(format!(" ❯ {cmd}▮"), st(Color::White)))
+                        };
+                        f.render_widget(Paragraph::new(bar), dims[2]);
+                        if let Some(e) = err {
+                            f.render_widget(
+                                Paragraph::new(Line::from(Span::styled(
+                                    format!(" ✗ {e}"),
+                                    st(RED),
+                                ))),
+                                dims[3],
+                            );
+                        }
+                        dims[1]
+                    } else {
+                        inner
+                    };
+                    hit_dialog_list = list_area;
                     let mut dsel = ListState::default();
                     dsel.select(Some(*sel_now));
                     f.render_stateful_widget(
                         List::new(labels.clone())
                             .highlight_symbol("» ")
                             .highlight_style(st(Color::White).add_modifier(Modifier::BOLD)),
-                        inner,
+                        list_area,
                         &mut dsel,
                     );
                 }
@@ -1806,7 +1922,9 @@ fn main() -> io::Result<()> {
                         let height = 5.min(rows[2].height.saturating_sub(2));
                         let x = area.x + (area.width.saturating_sub(width)) / 2;
                         let y = rows[2].y + (rows[2].height.saturating_sub(height)) / 2;
-                        let inner = box_title(f, Rect { x, y, width, height }, &dlog.title, YEL);
+                        let outer = Rect { x, y, width, height };
+                        let inner = box_title(f, outer, &dlog.title, YEL);
+                        hit_dialog_box = outer;
                         hit_dialog_list = inner;
                         let dims: [Rect; 2] =
                             Layout::vertical([Constraint::Length(1), Constraint::Min(0)])
@@ -1850,20 +1968,41 @@ fn main() -> io::Result<()> {
                             crossterm::event::KeyCode::Enter => confirm_dialog(&mut app),
                             _ => {}
                         },
-                        DialogKind::Browse { entries, sel, .. } => match key.code {
+                        DialogKind::Browse { entries, sel, cmd, err, .. } => match key.code {
                             crossterm::event::KeyCode::Up => *sel = sel.saturating_sub(1),
                             crossterm::event::KeyCode::Down => {
-                                *sel = (*sel + 1).min(entries.len() + 1)
+                                *sel = (*sel + 1).min(entries.len())
                             }
                             crossterm::event::KeyCode::PageUp => {
                                 *sel = sel.saturating_sub(10)
                             }
                             crossterm::event::KeyCode::PageDown => {
-                                *sel = (*sel + 10).min(entries.len() + 1)
+                                *sel = (*sel + 10).min(entries.len())
                             }
-                            crossterm::event::KeyCode::Esc => app.dialog = None,
-                            crossterm::event::KeyCode::Enter => browse_confirm(&mut app),
-                            crossterm::event::KeyCode::Backspace => browse_up(&mut app),
+                            // typing into the mini command line
+                            crossterm::event::KeyCode::Char(c) => {
+                                cmd.push(c);
+                                *err = None;
+                            }
+                            crossterm::event::KeyCode::Backspace => {
+                                if cmd.is_empty() {
+                                    // empty bar walks up one level, like cd ..
+                                    browse_up(&mut app);
+                                } else {
+                                    cmd.pop();
+                                    *err = None;
+                                }
+                            }
+                            // empty bar = confirm the selection; text = run cmd line
+                            crossterm::event::KeyCode::Enter => browse_exec(&mut app),
+                            crossterm::event::KeyCode::Esc => {
+                                if cmd.is_empty() {
+                                    app.dialog = None;
+                                } else {
+                                    cmd.clear();
+                                    *err = None;
+                                }
+                            }
                             _ => {}
                         },
                         DialogKind::Input { buffer, .. } => match key.code {
@@ -1930,28 +2069,40 @@ fn main() -> io::Result<()> {
                     let (mx, my) = (mouse.column, mouse.row);
                     if app.dialog.is_some() {
                         let mut confirmed = false;
-                        if my >= hit_dialog_list.y
-                            && my < hit_dialog_list.y + hit_dialog_list.height
-                            && mx >= hit_dialog_list.x
+                        // inside the dialog box: only list rows act — pwd, the
+                        // mini command line and margins never close the dialog
+                        if my >= hit_dialog_box.y
+                            && my < hit_dialog_box.y + hit_dialog_box.height
+                            && mx >= hit_dialog_box.x
+                            && mx < hit_dialog_box.x + hit_dialog_box.width
                         {
-                            if let Some(Dialog { kind, .. }) = app.dialog.as_mut() {
-                                let count = match kind {
-                                    DialogKind::Pick { items, .. } => items.len(),
-                                    DialogKind::Browse { entries, .. } => entries.len() + 2,
-                                    _ => 0,
-                                };
-                                if let DialogKind::Pick { sel, .. }
-                                | DialogKind::Browse { sel, .. } = kind
-                                {
-                                    let idx = (my - hit_dialog_list.y) as usize;
-                                    let idx = idx.min(count.saturating_sub(1));
-                                    if idx == *sel && last_click == Some((mx, my)) {
-                                        confirmed = true;
-                                    } else {
-                                        *sel = idx;
-                                        last_click = Some((mx, my));
+                            if my >= hit_dialog_list.y
+                                && my < hit_dialog_list.y + hit_dialog_list.height
+                                && mx >= hit_dialog_list.x
+                            {
+                                if let Some(Dialog { kind, .. }) = app.dialog.as_mut() {
+                                    let count = match kind {
+                                        DialogKind::Pick { items, .. } => items.len(),
+                                        DialogKind::Browse { entries, .. } => {
+                                            entries.len() + 1
+                                        }
+                                        _ => 0,
+                                    };
+                                    if let DialogKind::Pick { sel, .. }
+                                    | DialogKind::Browse { sel, .. } = kind
+                                    {
+                                        let idx = (my - hit_dialog_list.y) as usize;
+                                        let idx = idx.min(count.saturating_sub(1));
+                                        if idx == *sel && last_click == Some((mx, my)) {
+                                            confirmed = true;
+                                        } else {
+                                            *sel = idx;
+                                            last_click = Some((mx, my));
+                                        }
                                     }
                                 }
+                            } else {
+                                last_click = None;
                             }
                         } else {
                             app.dialog = None;
@@ -2083,6 +2234,15 @@ mod tests {
     }
 
     #[test]
+    fn resolve_paths() {
+        let home = home_dir();
+        assert_eq!(resolve_path("/base", "~/x.ipa"), format!("{home}/x.ipa"));
+        assert_eq!(resolve_path("/base", "/abs"), "/abs");
+        assert_eq!(resolve_path("/base", "./y"), "/base/./y");
+        assert_eq!(resolve_path("/base", "z/"), "/base/z/");
+    }
+
+    #[test]
     fn doctor_panel() {
         let d: Value = serde_json::from_str(
             r#"{"overall":"ok","checks":[{"name":"Python runtime","status":"ok","detail":"Python 3.14"},{"name":"AMDS","status":"fail","detail":"not found"}]}"#,
@@ -2203,6 +2363,7 @@ mod tests {
         assert!(!tidy_value("caminho/normal.ipa").contains('…'), "caminho comum intacto");
     }
 }
+
 
 
 
