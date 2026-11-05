@@ -67,6 +67,23 @@ pip install src/iPASide.Engine
 device pairing) is done by the OpenSide engine — a Python service spawned as a
 child process, communicating over NDJSON on stdio.
 
+## Provenance
+
+**openside is a fork** of [iPASide](https://github.com/pwnapplehat/iPASide)
+(MIT, by pwnapplehat). Part of this repository is inherited, part is new:
+
+| | from iPASide | new in openside |
+|---|---|---|
+| Signing engine | ✅ the entire Python engine (`src/iPASide.Engine`), untouched — same protocol, same data | — |
+| Device/Apple-id plumbing | ✅ pairing, anisette, app registry | — |
+| Terminal interface | — | ✅ the whole TUI (`tools/openside-cli`, Rust): menu, stylized views, mouse support, .ipa file browser, full en↔pt-BR translation |
+
+So the binary you run is new Rust, and the engine it spawns is the proven
+iPASide one — kept as-is on purpose: it is the piece that touches your Apple
+account and your apps, and stability there is worth more than churn.
+
+The MIT license from the original project is preserved.
+
 ## License
 
 MIT
