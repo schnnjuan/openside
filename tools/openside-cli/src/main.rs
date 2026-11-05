@@ -782,13 +782,17 @@ fn command_view(cmd: &str, data: &Value) -> Vec<Line<'static>> {
                 Some(v) => v.to_string(),
                 None => data.to_string(),
             };
+            // both badges the same width: the wider text wins, text centered
+            let own = format!("openside {}", env!("CARGO_PKG_VERSION"));
+            let eng = format!("engine {engine}");
+            let width = own.len().max(eng.len()) + 2;
             vec![
                 Line::from(Span::styled(
-                    format!(" openside {} ", env!("CARGO_PKG_VERSION")),
+                    format!("{:^width$}", own, width = width),
                     Style::new().fg(BG).bg(MAG).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
-                    format!(" engine {engine} "),
+                    format!("{:^width$}", eng, width = width),
                     Style::new().fg(BG).bg(CY).add_modifier(Modifier::BOLD),
                 )),
             ]
@@ -1637,19 +1641,25 @@ fn main() -> io::Result<()> {
             ])
             .areas(header[1]);
             let n_devices = connected(&app.devices);
+            let engine_chip = format!(
+                " engine {} ",
+                ENGINE_VERSION.get().map(String::as_str).unwrap_or("…")
+            );
+            let version_chip = format!(
+                "{:^width$}",
+                "0.1.0",
+                width = engine_chip.len().max(" 0.1.0 ".len())
+            );
             let mut chips = vec![
                 Span::styled(
-                    " 0.1.0 ",
+                    version_chip,
                     Style::new().fg(BG).bg(MAG).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
                 Span::styled(" anx set ", Style::new().fg(DARK).bg(GRAY)),
                 Span::raw(" "),
                 Span::styled(
-                    format!(
-                        " engine {} ",
-                        ENGINE_VERSION.get().map(String::as_str).unwrap_or("…")
-                    ),
+                    engine_chip.clone(),
                     Style::new()
                         .fg(BG)
                         .bg(CY)
@@ -2252,6 +2262,7 @@ mod tests {
         assert!(!tidy_value("caminho/normal.ipa").contains('…'), "caminho comum intacto");
     }
 }
+
 
 
 
