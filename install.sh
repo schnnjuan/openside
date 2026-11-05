@@ -7,6 +7,7 @@ set -eu
 REPO="schnnjuan/openside"
 PREFIX="${OPENSIDE_PREFIX:-$HOME/.local/bin}"
 SHARE="$HOME/.local/share/openside"
+TMP=""
 ENGINE_REPO="https://github.com/$REPO"
 ENGINE_DIR="$SHARE/engine/src/iPASide.Engine"
 
@@ -43,7 +44,7 @@ cleanup() {
     fi
     printf '%s' "$SHOW"
 }
-trap cleanup EXIT
+trap 'rm -rf "$TMP" 2>/dev/null; cleanup' EXIT
 
 # ---- header ----
 printf '%s' "$HIDE"
@@ -187,11 +188,15 @@ fi
 
 # ---- copy ----
 if [ "$LANG_CHOICE" = pt ]; then
-    M_CLONE="buscando o motor (clone raso)"
-    M_PY_DEPS="instalando o motor de assinatura"
+    M_FETCH="buscando o motor (clone raso do github)"
+    M_PY_DEPS="instalando as dependencias do motor (pip)"
     M_VENV_MAKE="criando o venv do motor"
-    M_CARGO="compilando openside (primeira vez demora alguns minutos)"
-    M_RUST="rust não encontrado — instalando via rustup"
+    M_CARGO="baixando e compilando openside (cargo)"
+    M_RUSTINIT="baixando rustup-init"
+    M_TOOL="instalando o rust via rustup"
+    M_ARCH="arquitetura não suportada: %s — abre uma issue em github.com/$REPO"
+    M_CRATES="✔ %s crates compilados"
+    M_DLFAIL="download do rustup-init falhou — confere a conexão e tenta de novo"
     M_WRAP="criando o comando openside em"
     M_DONE="✔ instalado em"
     M_RUN="rode:"
@@ -201,11 +206,15 @@ if [ "$LANG_CHOICE" = pt ]; then
     M_PIP="falha ao instalar o motor — confere a conexão e tenta de novo"
     M_BUILD="falha ao compilar o openside — tenta rodar cargo install openside na mão e me manda o erro"
 else
-    M_CLONE="fetching the engine (shallow clone)"
-    M_PY_DEPS="installing the signing engine"
+    M_FETCH="fetching the engine (shallow clone from github)"
+    M_PY_DEPS="installing engine dependencies (pip)"
     M_VENV_MAKE="creating the engine venv"
-    M_CARGO="compiling openside (first build takes a few minutes)"
-    M_RUST="rust not found — installing via rustup"
+    M_CARGO="downloading and compiling openside (cargo)"
+    M_RUSTINIT="downloading rustup-init"
+    M_TOOL="installing rust via rustup"
+    M_ARCH="unsupported arch: %s — open an issue at github.com/$REPO"
+    M_CRATES="✔ %s crates compiled"
+    M_DLFAIL="rustup-init download failed — check your connection and try again"
     M_WRAP="creating the openside command in"
     M_DONE="✔ installed"
     M_RUN="run:"
@@ -229,50 +238,120 @@ spinner() { # $1 = background pid
 }
 endspin() { printf '\r  \033[K\n'; }
 
-# ---- rustup bootstrap (before HOME-known msgs) ----
-if ! command -v cargo >/dev/null 2>&1; then
-    printf '  %s%s%s\n' "$GRAY" "$M_RUST" "$RESET"
-    if ! curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal; then
-        die "$M_CARGO_MISS"
+# ---- rust: real download bar for rustup-init, spinner for the toolchain ----
+TMP=$(mktemp -d)
+mb() { awk -v n="$1" 'BEGIN{printf "%.1f", n/1048576}'; }
+
+cargo_ok=0
+command -v cargo >/dev/null 2>&1 && cargo --version >/dev/null 2>&1 && cargo_ok=1
+if [ "$cargo_ok" = 0 ]; then
+    if command -v rustup >/dev/null 2>&1; then
+        printf '  %s%s%s\n' "$GRAY" "$M_TOOL" "$RESET"
+        ( rustup default stable ) &
+        PID=$!
+        spinner "$PID"
+        endspin
+        wait "$PID" || true
+    else
+        case "$(uname -m)" in
+            x86_64)        RT=x86_64-unknown-linux-gnu ;;
+            aarch64|arm64) RT=aarch64-unknown-linux-gnu ;;
+            *) die "$(printf "$M_ARCH" "$(uname -m)")" ;;
+        esac
+        printf '  %s%s (linux %s)%s\n' "$GRAY" "$M_RUSTINIT" "$RT" "$RESET"
+        SRC="https://static.rust-lang.org/rustup/dist/$RT/rustup-init"
+        TOTAL=$(curl -sIL "$SRC" | tr -d '\r' | awk 'tolower($1)=="content-length:"{v=$2} END{print v+0}')
+        curl -sL -o "$TMP/rustup-init" "$SRC" &
+        PID=$!
+        BAR_W=20
+        while kill -0 "$PID" 2>/dev/null; do
+            CUR=$(wc -c 2>/dev/null < "$TMP/rustup-init" || echo 0)
+            if [ "${TOTAL:-0}" -gt 0 ] 2>/dev/null; then
+                FILL=$((CUR * BAR_W / TOTAL))
+                PCT=$((CUR * 100 / TOTAL))
+                BAR=$(awk -v n="$FILL" 'BEGIN{for(i=0;i<n;i++)printf "█"}')
+                printf '\r  %s%s%s%*s  %3d%%  %s/%s MB  ' "$GRN" "$BAR" "$RESET" "$((BAR_W - FILL))" "" "$PCT" "$(mb "$CUR")" "$(mb "$TOTAL")"
+            else
+                case $((i % 4)) in
+                    0) S='▘' ;; 1) S='▝' ;; 2) S='▗' ;; 3) S='▖' ;;
+                esac
+                printf '\r  %s%s%s  %s MB  ' "$CY" "$S" "$RESET" "$(mb "$CUR")"
+                i=$((i + 1))
+            fi
+            sleep 0.1
+        done
+        wait "$PID" || die "$M_DLFAIL"
+        if [ "${TOTAL:-0}" -gt 0 ] 2>/dev/null; then
+            CUR=$(wc -c < "$TMP/rustup-init")
+            BAR=$(awk -v n="$BAR_W" 'BEGIN{for(i=0;i<n;i++)printf "█"}')
+            printf '\r  %s%s%s  100%%  %s/%s MB\n' "$GRN" "$BAR" "$RESET" "$(mb "$CUR")" "$(mb "$TOTAL")"
+        else
+            printf '\r  \033[K\n'
+        fi
+        chmod +x "$TMP/rustup-init"
+        printf '  %s%s%s\n' "$GRAY" "$M_TOOL" "$RESET"
+        ( "$TMP/rustup-init" -y --profile minimal >/dev/null 2>&1 ) &
+        PID=$!
+        spinner "$PID"
+        endspin
+        wait "$PID" || die "$M_CARGO_MISS"
+        . "$HOME/.cargo/env" 2>/dev/null || . "$HOME/.profile" 2>/dev/null || true
     fi
-    . "$HOME/.cargo/env" 2>/dev/null || . "$HOME/.profile" 2>/dev/null || true
-fi
-# shim do rustup instalado mas sem toolchain? escolhe o stable na hora
-if ! cargo --version >/dev/null 2>&1 && command -v rustup >/dev/null 2>&1; then
-    rustup -y default stable >/dev/null 2>&1 || true
 fi
 command -v cargo >/dev/null 2>&1 && cargo --version >/dev/null 2>&1 || die "$M_CARGO_MISS"
 
-# ---- engine: shallow clone + venv + requirements ----
+follow() { # $1 = worker pid · $2 = logfile · $3 = awk filter : live lines while it works
+    POS=0
+    while kill -0 "$1" 2>/dev/null; do
+        LEN=$(wc -l < "$2" 2>/dev/null || echo 0)
+        if [ "$LEN" -gt "$POS" ]; then
+            sed -n "$((POS + 1)),${LEN}p" "$2" | awk "$3"
+            POS=$LEN
+        fi
+        sleep 0.4
+    done
+    LEN=$(wc -l < "$2" 2>/dev/null || echo 0)
+    [ "$LEN" -gt "$POS" ] && sed -n "$((POS + 1)),${LEN}p" "$2" | awk "$3"
+    true
+}
+
+# ---- engine: shallow clone + venv + pip, each phase written out ----
 mkdir -p "$SHARE"
-printf '  %s%s%s\n' "$GRAY" "$M_CLONE" "$RESET"
-[ -d "$ENGINE_DIR/ipaside_engine" ] || {
+if [ ! -d "$ENGINE_DIR/ipaside_engine" ]; then
+    printf '  %s%s%s\n' "$GRAY" "$M_FETCH" "$RESET"
     ( git clone -q --depth 1 "$ENGINE_REPO" "$SHARE/engine" ) &
     PID=$!
     spinner "$PID"
     endspin
     wait "$PID" || die "$M_PIP"
-}
+fi
 printf '  %s%s%s\n' "$GRAY" "$M_VENV_MAKE" "$RESET"
 ( python3 -m venv "$SHARE/venv" ) &
 PID=$!
 spinner "$PID"
 endspin
 wait "$PID" || die "$M_VENV"
+
 printf '  %s%s%s\n' "$GRAY" "$M_PY_DEPS" "$RESET"
-( "$SHARE/venv/bin/pip" install -q --disable-pip-version-check -r "$ENGINE_DIR/requirements.txt" ) &
+( "$SHARE/venv/bin/pip" install --disable-pip-version-check --progress-bar off \
+    -r "$ENGINE_DIR/requirements.txt" > "$TMP/pip.log" 2>&1 ) &
 PID=$!
-spinner "$PID"
-endspin
+follow "$PID" "$TMP/pip.log" \
+    '/^[[:space:]]*(Collecting|Downloading|Using cached|Installing|Successfully)/ {printf "  %s\n", $0}'
 wait "$PID" || die "$M_PIP"
 
-# ---- openside: cargo install from crates.io ----
 printf '  %s%s%s\n' "$GRAY" "$M_CARGO" "$RESET"
-( cargo install -q openside ) &
+( cargo install openside > "$TMP/cargo.log" 2>&1 ) &
 PID=$!
-spinner "$PID"
-endspin
+follow "$PID" "$TMP/cargo.log" \
+    '/^[[:space:]]*(Updating|Downloading|Downloaded|Installing|Installed) / {printf "  %s\n", $0}'
 wait "$PID" || die "$M_BUILD"
+CRATES=$(awk '/^ *Compiling /{n++} END{print n+0}' "$TMP/cargo.log")
+if [ "$CRATES" -gt 0 ] 2>/dev/null; then
+    printf '  %s%s%s\n' "$GRN" "$(printf "$M_CRATES" "$CRATES")" "$RESET"
+else
+    printf '  %s✔ installed openside%s\n' "$GRN" "$RESET"
+fi
 BIN=$(command -v openside 2>/dev/null || true)
 [ -x "$BIN" ] || BIN="$HOME/.cargo/bin/openside"
 [ -x "$BIN" ] || die "$M_BUILD"
