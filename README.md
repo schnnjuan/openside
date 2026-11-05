@@ -1,14 +1,10 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/schnnjuan/openside/openside/docs/brand/openside.svg" alt="openside" width="440">
+<img src="https://raw.githubusercontent.com/schnnjuan/openside/openside/docs/brand/openside.svg" alt="openside" width="440"/>
 
-# openside
+**sideload .ipas from a beautiful terminal**
 
-**Sideloading .ipas from a beautiful terminal.**
-
-A keyboard-and-mouse driven terminal interface (ratatui) that signs, installs,
-renews and tracks sideloaded apps on your iPhone — no jailbreak, no paid
-developer account.
+sign · install · renew · track expiry · apple id · anisette — one TUI, mouse and keyboard
 
 [![Release](https://img.shields.io/github/v/release/schnnjuan/openside?style=for-the-badge&color=026D4F)](https://github.com/schnnjuan/openside/releases)
 [![crates.io](https://img.shields.io/crates/v/openside?style=for-the-badge&color=24A067)](https://crates.io/crates/openside)
@@ -18,74 +14,48 @@ developer account.
 
 ---
 
-## Install
+## what it does
+
+- **sideload an .ipa** — sign + install straight from the file browser
+- **expiry tracking** — every installed app, days left, expired / expiring counts
+- **renew** — all apps expiring soon, or one at a time
+- **apple id** — sign in, accounts, teams, cert / app id / device slots
+- **device** — connected iPhones, developer mode, pairing file, installed apps
+- **ipa tools** — inspect metadata, sign to a new file
+
+## install
 
 ```bash
 cargo install openside
-```
-
-Then just run:
-
-```bash
 openside
 ```
 
-Requires a Python ≥ 3.12 environment for the signing engine. The engine lives
-in this repository (`src/iPASide.Engine`):
+Python 3.12+ for the signing engine, from this repo:
 
 ```bash
 pip install src/iPASide.Engine
 ```
 
-## What it does
+## the interface
 
-| | |
+- full keyboard and mouse: click, click again or `⏎` to run
+- command menu on the left, stylized output on the right (expiry badges, device chips, doctor checks)
+- .ipa file browser with `ls`, `cd` and a mini command line: relative, `~` and absolute paths, quick `cd ..` with Backspace
+- English / Português (BR) picker at first run, switchable from the version screen; the whole interface is translated
+
+## engine
+
+the terminal is the product; signing happens in a Python engine spawned as a child process over NDJSON stdio.
+
+## provenance
+
+**openside is a fork** of [iPASide](https://github.com/pwnapplehat/iPASide) (MIT, by pwnapplehat).
+
+| inherited from iPASide | new in openside |
 |---|---|
-| **Sideload an .ipa** | sign + install straight from the file browser |
-| **Expiry tracking** | every installed app with days left, expired / expiring counts |
-| **Renew** | all apps expiring soon, or one app at a time |
-| **Apple ID** | sign in, list accounts, teams, cert / app-id / device slots |
-| **Device** | connected iPhones, developer-mode state, pairing file, installed apps |
-| **Anisette** | provisioning status |
-| **Handy .ipa tools** | inspect metadata, sign to a new file |
+| the whole Python engine (`src/iPASide.Engine`), untouched | the entire TUI (`tools/openside-cli`, Rust) |
+| pairing, anisette, app registry | menu, stylized views, mouse, .ipa browser, en↔pt-BR |
 
-## The interface
+the engine stays untouched on purpose: it touches your Apple account and your apps, and stability there beats churn.
 
-- **Full keyboard & mouse** — pick an item, click again (or `⏎`) to run.
-- **Menu of commands** in the left column; live output panel on the right with
-  stylized views per command (gauges, expiry badges, device chips) — never raw
-  JSON.
-- **File browser for .ipa** with `ls`, `cd` and a mini command line — type a
-  relative/absolute path direct, or `cd ~/Downloads` and click.
-- **First-run language picker** (English / Português-BR), switchable anytime
-  from the *version* screen; everything (menu, dialogues, output, notes) is
-  fully translated.
-- **Nothing is typed at you**: every action is a wizard or a picker; only the
-  .ipa path input accepts typing.
-
-## Engine
-
-`openside` is a terminal frontend; the heavy lifting (apple-id auth, signing,
-device pairing) is done by the OpenSide engine — a Python service spawned as a
-child process, communicating over NDJSON on stdio.
-
-## Provenance
-
-**openside is a fork** of [iPASide](https://github.com/pwnapplehat/iPASide)
-(MIT, by pwnapplehat). Part of this repository is inherited, part is new:
-
-| | from iPASide | new in openside |
-|---|---|---|
-| Signing engine | ✅ the entire Python engine (`src/iPASide.Engine`), untouched — same protocol, same data | — |
-| Device/Apple-id plumbing | ✅ pairing, anisette, app registry | — |
-| Terminal interface | — | ✅ the whole TUI (`tools/openside-cli`, Rust): menu, stylized views, mouse support, .ipa file browser, full en↔pt-BR translation |
-
-So the binary you run is new Rust, and the engine it spawns is the proven
-iPASide one — kept as-is on purpose: it is the piece that touches your Apple
-account and your apps, and stability there is worth more than churn.
-
-The MIT license from the original project is preserved.
-
-## License
-
-MIT
+MIT.
