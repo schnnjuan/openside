@@ -30,10 +30,10 @@ cargo install openside
 openside
 ```
 
-Python 3.12+ for the signing engine, from this repo:
+or one line for everything, including the signing engine:
 
 ```bash
-pip install src/iPASide.Engine
+curl -fsSL https://openside.schnnjuan.com/install.sh | sh
 ```
 
 ## the interface
