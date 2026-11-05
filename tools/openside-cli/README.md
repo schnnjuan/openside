@@ -4,7 +4,7 @@
 
 **sideload .ipas from a beautiful terminal**
 
-sign · install · renew · track expiry · apple id · anisette — one TUI, mouse and keyboard
+sign · install · renew · track expiry · apple id · anisette. one TUI, mouse and keyboard
 
 [![Release](https://img.shields.io/github/v/release/schnnjuan/openside?style=for-the-badge&color=026D4F)](https://github.com/schnnjuan/openside/releases)
 [![crates.io](https://img.shields.io/crates/v/openside?style=for-the-badge&color=24A067)](https://crates.io/crates/openside)
@@ -16,12 +16,12 @@ sign · install · renew · track expiry · apple id · anisette — one TUI, mo
 
 ## what it does
 
-- **sideload an .ipa** — sign + install straight from the file browser
-- **expiry tracking** — every installed app, days left, expired / expiring counts
-- **renew** — all apps expiring soon, or one at a time
-- **apple id** — sign in, accounts, teams, cert / app id / device slots
-- **device** — connected iPhones, developer mode, pairing file, installed apps
-- **ipa tools** — inspect metadata, sign to a new file
+- **sideload an .ipa**: sign + install straight from the file browser
+- **expiry tracking**: every installed app, days left, expired / expiring counts
+- **renew**: all apps expiring soon, or one at a time
+- **apple id**: sign in, accounts, teams, cert / app id / device slots
+- **device**: connected iPhones, developer mode, pairing file, installed apps
+- **ipa tools**: inspect metadata, sign to a new file
 
 ## install
 
