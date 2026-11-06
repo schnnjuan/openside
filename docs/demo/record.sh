@@ -16,7 +16,7 @@ OUT=/home/schnnjuan/demo-take.mp4
 echo "Switch to workspace 3 now. Recording starts in 3s..."
 sleep 3
 
-$KITTY --title "OpenSide Demo" "$TUI" >/tmp/kitty.log 2>&1 &
+setsid $KITTY --title "OpenSide Demo" "$TUI" >/tmp/kitty.log 2>&1 &
 sleep 4
 
 GEO=$(hyprctl clients -j | python3 -c "import sys,json; d=json.load(sys.stdin); c=[x for x in d if 'OpenSide Demo' in (x.get('title') or '')][0]; print(f\"{c['at'][0]},{c['at'][1]} {c['size'][0]}x{c['size'][1]}\")")
